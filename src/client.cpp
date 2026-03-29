@@ -6,24 +6,24 @@
 #include <cstring>
 #include <iomanip>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include "packet.h"
-
+#include <ws2tcpip.h>
+#include <winsock2.h>
+#include "./headers/packet.h"
+#include <pthread.h>
 using namespace std;
 
 int main(int argc, char *argv[])
 {
-    cout << "🚀 LinkFlow Client Starting..." << endl;
+    cout << " LinkFlow Client Starting..." << endl;
 
     // STEP 2: Create UDP Socket
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0)
     {
-        cerr << "❌ Socket creation failed: " << strerror(errno) << endl;
+        cerr << " Socket creation failed: " << strerror(errno) << endl;
         return 1;
     }
-    cout << "✅ UDP socket created (fd=" << sockfd << ")" << endl;
+    cout << " UDP socket created (fd=" << sockfd << ")" << endl;
 
     // STEP 3: Server Address Setup
     struct sockaddr_in server_addr;
@@ -39,11 +39,11 @@ int main(int argc, char *argv[])
     // Convert IP address from text to binary
     if (inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) <= 0)
     {
-        cerr << "❌ Invalid address" << endl;
+        cerr << " Invalid address" << endl;
         close(sockfd);
         return 1;
     }
-    cout << "✅ Server address configured: 127.0.0.1:" << PORT << endl;
+    cout << "Server address configured: 127.0.0.1:" << PORT << endl;
 
     // STEP 4: Create & Fill FIRST Packet
     struct Packet pkt;
@@ -83,7 +83,7 @@ int main(int argc, char *argv[])
     // PAYLOAD
     strcpy(pkt.data, "Phase 1.2 Hello! This is the test payload data."); // Test message
 
-    cout << "📦 Packet prepared:" << endl;
+    cout << " Packet prepared:" << endl;
     cout << "   CORE FIELDS:" << endl;
     cout << "   - Sequence: " << pkt.seq_num << endl;
     cout << "   - ACK Number: " << pkt.ack_num << endl;
@@ -104,55 +104,55 @@ int main(int argc, char *argv[])
     cout << "   - Username: " << pkt.username << endl;
     cout << "\n   PAYLOAD:" << endl;
     cout << "   - Data: " << pkt.data << endl;
-    cout << "\n   📏 Total Packet Size: " << sizeof(pkt) << " bytes" << endl;
+    cout << "\n   Total Packet Size: " << sizeof(pkt) << " bytes" << endl;
 
     // STEP 5: Send Packet
-    cout << "\n📤 Sending packet to server..." << endl;
-    int bytes_sent = sendto(sockfd, &pkt, sizeof(pkt), 0,
+    cout << "\n Sending packet to server..." << endl;
+    int bytes_sent = sendto(sockfd, (const char *)&pkt, sizeof(pkt), 0,
                             (struct sockaddr *)&server_addr, addr_len);
 
     if (bytes_sent < 0)
     {
-        cerr << "❌ sendto failed: " << strerror(errno) << endl;
+        cerr << "sendto failed: " << strerror(errno) << endl;
         close(sockfd);
         return 1;
     }
-    cout << "✅ Sent " << bytes_sent << " bytes to server" << endl;
+    cout << " Sent " << bytes_sent << " bytes to server" << endl;
 
     // STEP 5: Receive ACK
-    cout << "\n⏳ Waiting for ACK from server..." << endl;
+    cout << "\nWaiting for ACK from server..." << endl;
     struct Packet ack_pkt;
     memset(&ack_pkt, 0, sizeof(ack_pkt));
 
-    int bytes_recv = recvfrom(sockfd, &ack_pkt, sizeof(ack_pkt), 0,
+    int bytes_recv = recvfrom(sockfd, (char *)&ack_pkt, sizeof(ack_pkt), 0,
                               (struct sockaddr *)&server_addr, &addr_len);
 
     if (bytes_recv < 0)
     {
-        cerr << "❌ recvfrom failed: " << strerror(errno) << endl;
+        cerr << " recvfrom failed: " << strerror(errno) << endl;
         close(sockfd);
         return 1;
     }
 
-    cout << "✅ ACK received (" << bytes_recv << " bytes):" << endl;
+    cout << "ACK received (" << bytes_recv << " bytes):" << endl;
     cout << "   - ACK Number: " << ack_pkt.ack_num << endl;
     cout << "   - Type: " << ack_pkt.type << endl;
 
     // Verify ACK matches sent packet
     if (ack_pkt.ack_num == pkt.seq_num)
     {
-        cout << "✅ ACK verification PASSED (seq=" << pkt.seq_num << ")" << endl;
+        cout << " ACK verification PASSED (seq=" << pkt.seq_num << ")" << endl;
     }
     else
     {
-        cout << "⚠️  ACK mismatch: expected " << pkt.seq_num
+        cout << " ACK mismatch: expected " << pkt.seq_num
              << ", got " << ack_pkt.ack_num << endl;
     }
 
     // STEP 6: Cleanup
     close(sockfd);
-    cout << "\n🎉 Phase 1.2 COMPLETE!" << endl;
-    cout << "📊 Summary:" << endl;
+    cout << "\n Phase 1.2 COMPLETE!" << endl;
+    cout << " Summary:" << endl;
     cout << "   - Socket operations: SUCCESS" << endl;
     cout << "   - Packet transmission: SUCCESS" << endl;
     cout << "   - ACK reception: SUCCESS" << endl;

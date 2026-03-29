@@ -5,10 +5,9 @@
 
 #define PORT 12345
 #define DATA_SIZE 1000
-#define FILENAME_MAX 64
+#define MAX_FILENAME 64
 #define USERNAME_MAX 32
 
-// Production-grade packet for ALL features
 struct Packet
 {
     // CORE (Phase 1-2)
@@ -24,7 +23,7 @@ struct Packet
     // FILE TRANSFER (Phase 2)
     uint32_t file_size;          // Total file bytes
     uint32_t chunk_offset;       // Byte position in file
-    char filename[FILENAME_MAX]; // "document.pdf"
+    char filename[MAX_FILENAME]; // "document.pdf"
 
     // PERFORMANCE (Phase 2.5-5)
     uint8_t stream_id;   // Multi-connection (0-3)
