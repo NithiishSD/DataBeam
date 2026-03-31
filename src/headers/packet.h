@@ -22,7 +22,7 @@ struct Packet
     uint32_t crc32;    // CRC32 checksum
     uint8_t parity;    // Simple parity bit
     uint16_t checksum; // Internet checksum
-
+    uint16_t data_len; // Actual data length in this packet
     // FILE TRANSFER (Phase 2)
     uint32_t file_size;          // Total file bytes
     uint32_t chunk_offset;       // Byte position in file
@@ -45,9 +45,8 @@ struct Packet
     char username[USERNAME_MAX]; // "john_doe"
 
     // PAYLOAD (compressed/encrypted data)
-    char data[DATA_SIZE];  // File chunk/message
-} __attribute__((packed)); // Zero padding!
-
+    char data[DATA_SIZE + 1]; // File chunk/message
+} __attribute__((packed));    // Zero padding!
 
 // Serialize packet: convert host byte order to network byte order
 inline void serialize_packet(struct Packet *pkt)
@@ -56,6 +55,7 @@ inline void serialize_packet(struct Packet *pkt)
     pkt->ack_num = htons(pkt->ack_num);
     pkt->crc32 = htonl(pkt->crc32);
     pkt->file_size = htonl(pkt->file_size);
+    pkt->data_len = htons(pkt->data_len);
     pkt->chunk_offset = htonl(pkt->chunk_offset);
     pkt->checksum = htons(pkt->checksum);
     pkt->rtt_sample = htons(pkt->rtt_sample);
@@ -68,6 +68,7 @@ inline void deserialize_packet(struct Packet *pkt)
     pkt->ack_num = ntohs(pkt->ack_num);
     pkt->crc32 = ntohl(pkt->crc32);
     pkt->file_size = ntohl(pkt->file_size);
+    pkt->data_len = ntohs(pkt->data_len);
     pkt->chunk_offset = ntohl(pkt->chunk_offset);
     pkt->checksum = ntohs(pkt->checksum);
     pkt->rtt_sample = ntohs(pkt->rtt_sample);

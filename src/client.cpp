@@ -134,6 +134,7 @@ void *sender_thread(void *arg)
         pkt.file_size = file_size;
         pkt.chunk_offset = current_offset;
         pkt.crc32 = calculate_crc32((unsigned char *)compressed_data, compressed_len);
+        pkt.data_len = (uint16_t)compressed_len; // [CHANGED] Add data_len field for variable payload size
         memcpy(pkt.data, compressed_data, compressed_len);
         strcpy(pkt.username, "client_user");
         // [CHANGED] SR has no congestion window / EWMA RTT; omit those fields

@@ -194,7 +194,7 @@ int main()
             // Sanity check — reject malformed packets before touching data
             bool crc_valid = false;
 
-            if (actual_compressed_len == 0 || actual_compressed_len > DATA_SIZE)
+            if (actual_compressed_len == 0 || actual_compressed_len > (size_t)(DATA_SIZE + 1))
             {
                 cerr << "[SERVER] Invalid data_len=" << actual_compressed_len
                      << " for seq=" << pkt.seq_num << " — dropping" << endl;
@@ -303,32 +303,31 @@ int main()
                         // compress_data stores the marker byte at offset 0, so we pass
                         // the full data field; decompress_data reads the marker itself.
                         // ----------------------------------------------------------------
-                        size_t expected_raw_len;
-                        if (buffered_pkt.chunk_offset + DATA_SIZE >= (size_t)buffered_pkt.file_size)
-                            expected_raw_len = buffered_pkt.file_size - buffered_pkt.chunk_offset;
-                        else
-                            expected_raw_len = DATA_SIZE;
+                        // Use data_len from packet directly — no geometry guessing needed
+                        size_t buf_comp_len = buffered_pkt.data_len;
 
-                        // Compressed length = raw + 1 (marker byte), capped at DATA_SIZE
-                        size_t buf_comp_len = min(expected_raw_len + 1, (size_t)DATA_SIZE);
+                        // Sanity check before CRC
+                        if (buf_comp_len == 0 || buf_comp_len > DATA_SIZE + 1)
+                        {
+                            cerr << "[SERVER] Invalid data_len=" << buf_comp_len
+                                 << " in buffered seq=" << expected_seq_num << " — dropping" << endl;
+                            receive_buffer.erase(expected_seq_num);
+                            break;
+                        }
 
-                        // ----------------------------------------------------------------
                         // CRC verification — verify BEFORE decompressing
-                        // ----------------------------------------------------------------
                         uint32_t actual_crc = calculate_crc32(
                             reinterpret_cast<const unsigned char *>(buffered_pkt.data),
                             buf_comp_len);
 
                         if (actual_crc != buffered_pkt.crc32)
                         {
-                            cerr << "[SERVER] CRC mismatch on buffered seq="
-                                 << expected_seq_num
-                                 << " expected=" << buffered_pkt.crc32
-                                 << " got=" << actual_crc << endl;
+                            cerr << "[SERVER] CRC mismatch on buffered seq=" << expected_seq_num
+                                 << " expected=0x" << hex << buffered_pkt.crc32
+                                 << " got=0x" << actual_crc << dec << endl;
 
-                            // Erase corrupted packet — SR will retransmit it
                             receive_buffer.erase(expected_seq_num);
-                            break; // stop draining buffer; wait for clean retransmit
+                            break;
                         }
 
                         // ----------------------------------------------------------------
