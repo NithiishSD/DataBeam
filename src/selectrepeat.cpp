@@ -2,7 +2,7 @@
 // File: src/selectrepeat.cpp
 // Purpose: Per-packet timeout tracking and ACK bitmap window management
 
-#include "headers/selectrepeat.h"
+#include "./headers/selectrepeat.h"
 #include <iostream>
 #include <cstring>
 #include <cmath>
@@ -175,7 +175,7 @@ bool SelectiveRepeatARQ::prepare_retransmit(uint16_t seq_num, Packet &pkt_out)
     // Check maximum retransmit limit
     if (wp.retransmit_count >= SR_MAX_RETRANSMITS)
     {
-        cout << "⚠️  Max retransmits reached for seq=" << seq_num << endl;
+        cout << "  Max retransmits reached for seq=" << seq_num << endl;
         pthread_mutex_unlock(&window_mutex);
         return false;
     }
@@ -228,7 +228,7 @@ void SelectiveRepeatARQ::print_window_state() const
 {
     pthread_mutex_lock(&window_mutex);
 
-    cout << "🪟 SR Window State:" << endl;
+    cout << " SR Window State:" << endl;
     cout << "   send_base=" << send_base << ", next_seq=" << next_seq_num << endl;
     cout << "   In-flight packets: " << window_buffer.size() << "/" << SR_WINDOW_SIZE << endl;
     cout << "   ACK bitmap: ";
