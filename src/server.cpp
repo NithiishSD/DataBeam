@@ -189,21 +189,33 @@ int main()
                 connection_initialized = true;
             }
 
-            // CRC Validation
-            uint32_t expected_crc = pkt.crc32;
-            bool crc_valid = false;
-            size_t actual_compressed_len = DATA_SIZE;
+            size_t actual_compressed_len = pkt.data_len;
 
-            for (size_t len = 0; len <= DATA_SIZE; len++)
+            // Sanity check — reject malformed packets before touching data
+            bool crc_valid = false;
+
+            if (actual_compressed_len == 0 || actual_compressed_len > DATA_SIZE)
             {
-                if (calculate_crc32(reinterpret_cast<unsigned char *>(pkt.data), len) == expected_crc)
+                cerr << "[SERVER] Invalid data_len=" << actual_compressed_len
+                     << " for seq=" << pkt.seq_num << " — dropping" << endl;
+            }
+            else
+            {
+                uint32_t computed_crc = calculate_crc32(
+                    reinterpret_cast<const unsigned char *>(pkt.data),
+                    actual_compressed_len);
+
+                if (computed_crc == pkt.crc32)
                 {
                     crc_valid = true;
-                    actual_compressed_len = len;
-                    break;
+                }
+                else
+                {
+                    cerr << "[SERVER] CRC FAIL seq=" << pkt.seq_num
+                         << " expected=0x" << hex << pkt.crc32
+                         << " got=0x" << computed_crc << dec << endl;
                 }
             }
-
             if (crc_valid)
             {
                 // 3. Feature: Individual ACKs (Selective Repeat Support)
