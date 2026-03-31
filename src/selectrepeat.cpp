@@ -175,7 +175,7 @@ bool SelectiveRepeatARQ::prepare_retransmit(uint16_t seq_num, Packet &pkt_out)
     // Check maximum retransmit limit
     if (wp.retransmit_count >= SR_MAX_RETRANSMITS)
     {
-        cout << "⚠️  Max retransmits reached for seq=" << seq_num << endl;
+        cout << "  Max retransmits reached for seq=" << seq_num << endl;
         pthread_mutex_unlock(&window_mutex);
         return false;
     }

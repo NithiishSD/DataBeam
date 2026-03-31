@@ -20,7 +20,8 @@
 // Your project headers
 #include "./headers/packet.h"
 #include "./headers/arq.h"
-
+#include "./headers/compress.h"
+#include "./headers/crchw.h"
 using namespace std;
 
 // ----------------------------------------------------------------------------
