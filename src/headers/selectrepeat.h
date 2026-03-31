@@ -47,7 +47,7 @@ private:
     std::map<uint16_t, WindowPacket> window_buffer;
 
     // Thread synchronization
-    pthread_mutex_t window_mutex; // Protects window_buffer and state variables
+    mutable pthread_mutex_t window_mutex; // Protects window_buffer and state variables
 
     // RTT & Timeout (optional congestion control integration)
     uint32_t rto_ms; // Retransmission timeout in milliseconds

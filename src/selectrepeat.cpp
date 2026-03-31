@@ -2,7 +2,7 @@
 // File: src/selectrepeat.cpp
 // Purpose: Per-packet timeout tracking and ACK bitmap window management
 
-#include "headers/selectrepeat.h"
+#include "./headers/selectrepeat.h"
 #include <iostream>
 #include <cstring>
 #include <cmath>
@@ -228,7 +228,7 @@ void SelectiveRepeatARQ::print_window_state() const
 {
     pthread_mutex_lock(&window_mutex);
 
-    cout << "🪟 SR Window State:" << endl;
+    cout << " SR Window State:" << endl;
     cout << "   send_base=" << send_base << ", next_seq=" << next_seq_num << endl;
     cout << "   In-flight packets: " << window_buffer.size() << "/" << SR_WINDOW_SIZE << endl;
     cout << "   ACK bitmap: ";

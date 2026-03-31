@@ -14,7 +14,7 @@
 #include <pthread.h>
 #include "./headers/packet.h"
 #include "./headers/selectrepeat.h" // [CHANGED] GBN → SR header
-
+#include "./headers/compress.h"
 using namespace std;
 
 // ----------------------------------------------------------------------------
@@ -86,7 +86,7 @@ void *sender_thread(void *arg)
 
         uint32_t current_offset = chunk_offset;
         // [CHANGED] SR tracks next_seq_num internally; read it directly
-        uint16_t seq = arq.next_seq_num;
+        uint16_t seq = arq.get_next_seq_num();
         pthread_mutex_unlock(&arq_mutex);
 
         // Read file chunk outside the lock
@@ -145,7 +145,7 @@ void *sender_thread(void *arg)
         {
             pthread_mutex_lock(&arq_mutex);
             arq.record_sent_packet(pkt); // records pkt and sets send timestamp
-            arq.next_seq_num++;          // [CHANGED] advance manually (no increment_seq_num in SR)
+            arq.increment_seq_num();          // [CHANGED] advance manually (no increment_seq_num in SR)
             chunk_offset += bytes_read;
             chunks_sent++;
             total_bytes_sent += bytes_read;
@@ -238,7 +238,7 @@ void *timeout_thread(void *arg)
 
             if (ready)
             {
-                cout << "⏱️  Timeout! SR retransmitting only seq=" << timed_out_seq
+                cout << "  Timeout! SR retransmitting only seq=" << timed_out_seq
                      << " (not full window)" << endl;
 
                 struct Packet pkt_send = retransmit_pkt;
@@ -369,7 +369,7 @@ int main(int argc, char *argv[])
     double elapsed = chrono::duration_cast<chrono::milliseconds>(end_time - start_time).count() / 1000.0;
     double throughput = (total_bytes_sent * 8.0) / (elapsed * 1e6);
 
-    cout << "\n✅ File transfer COMPLETE!" << endl;
+    cout << "\n File transfer COMPLETE!" << endl;
     cout << " Performance Summary:" << endl;
     cout << "   - Total chunks transmitted: " << chunks_sent << endl;
     cout << "   - Total bytes sent:         " << total_bytes_sent << endl;
