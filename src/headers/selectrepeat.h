@@ -61,6 +61,7 @@ public:
     bool can_send_packet() const;
     uint16_t get_send_base() const { return send_base; }
     uint16_t get_next_seq_num() const { return next_seq_num; }
+    void set_start_seq(uint16_t seq);
     void increment_seq_num() { next_seq_num++; }
     int get_in_flight_count() const;
 

@@ -38,6 +38,17 @@ int SelectiveRepeatARQ::get_in_flight_count() const
     return count;
 }
 
+// Set starting sequence number (for resuming transfers)
+void SelectiveRepeatARQ::set_start_seq(uint16_t seq)
+{
+    pthread_mutex_lock(&window_mutex);
+    send_base = seq;
+    next_seq_num = seq;
+    window_buffer.clear();
+    ack_bitmap.reset();
+    pthread_mutex_unlock(&window_mutex);
+}
+
 // Record a packet as sent with timestamp
 void SelectiveRepeatARQ::record_sent_packet(const Packet &pkt)
 {

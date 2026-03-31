@@ -16,6 +16,7 @@
 #include "./headers/selectrepeat.h" // [CHANGED] GBN → SR header
 #include "./headers/compress.h"
 #include "./headers/crchw.h"
+#include "./headers/crypto.h"
 #include <filesystem> // C++17
 using namespace std;
 
@@ -127,6 +128,16 @@ void *sender_thread(void *arg)
         // Build packet
         struct Packet pkt;
         memset(&pkt, 0, sizeof(pkt));
+
+        generate_iv(pkt.iv);
+
+        char encrypted_data[DATA_SIZE + 1];
+        if (!aes_encrypt((const uint8_t*)compressed_data, compressed_len, SHARED_SECRET_KEY, pkt.iv, (uint8_t*)encrypted_data)) {
+            cerr << " Encryption failed!" << endl;
+            transfer_complete = true;
+            break;
+        }
+
         pkt.seq_num = seq;
         pkt.ack_num = 0;
         pkt.type = (current_offset + bytes_read >= (uint32_t)file_size)
@@ -135,17 +146,20 @@ void *sender_thread(void *arg)
         strcpy(pkt.filename, filename.c_str());
         pkt.file_size = file_size;
         pkt.chunk_offset = current_offset;
-        pkt.crc32 = calculate_crc32((unsigned char *)compressed_data, compressed_len);
-        pkt.data_len = (uint16_t)compressed_len; // [CHANGED] Add data_len field for variable payload size
-        memcpy(pkt.data, compressed_data, compressed_len);
+        pkt.crc32 = calculate_crc32((unsigned char *)encrypted_data, compressed_len);
+        pkt.data_len = (uint16_t)compressed_len;
+        memcpy(pkt.data, encrypted_data, compressed_len);
         strcpy(pkt.username, "client_user");
-        // [CHANGED] SR has no congestion window / EWMA RTT; omit those fields
         pkt.window_size = SR_WINDOW_SIZE;
         pkt.rtt_sample = 0;
 
         // Serialize a copy for sending
         struct Packet pkt_send = pkt;
         serialize_packet(&pkt_send);
+
+        memset(pkt_send.hmac, 0, 32);
+        generate_hmac((const uint8_t*)&pkt_send, sizeof(pkt_send), SHARED_SECRET_KEY, pkt_send.hmac);
+        memcpy(pkt.hmac, pkt_send.hmac, 32);
 
         int bytes_sent = sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
                                 (struct sockaddr *)&server_addr, addr_len);
@@ -372,6 +386,38 @@ int main(int argc, char *argv[])
     }
 
     cout << " SR Window=" << SR_WINDOW_SIZE << ", RTO=" << SR_PACKET_TIMEOUT_MS << "ms" << endl;
+    
+    // Check for resume checkpoint
+    uint32_t starting_seq = 1;
+    uint32_t starting_offset = 0;
+    ifstream in("resume.json");
+    if (in.is_open())
+    {
+        stringstream buf;
+        buf << in.rdbuf();
+        string content = buf.str();
+        size_t f_pos = content.find("\"filename\"");
+        size_t s_pos = content.find("\"last_seq\"");
+        if (f_pos != string::npos && s_pos != string::npos) {
+            size_t f_start = content.find("\"", f_pos + 10) + 1;
+            size_t f_end = content.find("\"", f_start);
+            string saved = content.substr(f_start, f_end - f_start);
+            if (saved == filename) {
+                size_t s_start = content.find(":", s_pos) + 1;
+                while (isspace(content[s_start])) s_start++;
+                size_t s_end = content.find_first_of(",}", s_start);
+                while (s_end > s_start && isspace(content[s_end - 1])) s_end--;
+                int last_seq = stoi(content.substr(s_start, s_end - s_start));
+                starting_seq = last_seq + 1;
+                starting_offset = last_seq * DATA_SIZE;
+                cout << " Resuming transfer from checkpoint: seq=" << starting_seq << ", offset=" << starting_offset << endl;
+            }
+        }
+    }
+    
+    chunk_offset = starting_offset;
+    arq.set_start_seq((uint16_t)starting_seq);
+
     cout << "\n Starting Multithreaded Selective Repeat Transmission...\n"
          << endl;
 

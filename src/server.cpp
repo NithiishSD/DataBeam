@@ -14,6 +14,7 @@
 #include "./headers/arq.h"
 #include "./headers/compress.h"
 #include "./headers/crchw.h"
+#include "./headers/crypto.h"
 using namespace std;
 
 // Work queue — holds CRC-verified raw packets waiting to be decompressed
@@ -35,13 +36,28 @@ void create_received_dir()
         mkdir("received");
 }
 
-void save_checkpoint(const string &filename, uint16_t expected_seq)
+void save_checkpoint(const string &filename, uint32_t total_chunks, uint16_t expected_seq, const bool* slot_occupied)
 {
     ofstream out("resume.json");
     if (out.is_open())
     {
-        out << "{\n  \"filename\": \"" << filename << "\",\n";
-        out << "  \"expected_seq\": " << expected_seq << "\n}\n";
+        out << "{\n";
+        out << "  \"filename\": \"" << filename << "\",\n";
+        out << "  \"total_chunks\": " << total_chunks << ",\n";
+        out << "  \"last_seq\": " << (expected_seq > 0 ? expected_seq - 1 : 0) << ",\n";
+        out << "  \"received_chunks\": [";
+        bool first = true;
+        if (slot_occupied != nullptr) {
+            for (int i = 0; i < 1024; i++) {
+                if (slot_occupied[i]) {
+                    if (!first) out << ", ";
+                    uint16_t dist = (i - (expected_seq % 1024) + 1024) % 1024;
+                    out << (expected_seq + dist);
+                    first = false;
+                }
+            }
+        }
+        out << "]\n}\n";
     }
 }
 
@@ -54,7 +70,7 @@ uint16_t load_checkpoint(const string &target_filename)
     buf << in.rdbuf();
     string content = buf.str();
     size_t f_pos = content.find("\"filename\"");
-    size_t s_pos = content.find("\"expected_seq\"");
+    size_t s_pos = content.find("\"last_seq\"");
     if (f_pos == string::npos || s_pos == string::npos)
         return 1;
     size_t f_start = content.find("\"", f_pos + 10) + 1;
@@ -68,7 +84,7 @@ uint16_t load_checkpoint(const string &target_filename)
     size_t s_end = content.find_first_of(",}", s_start);
     while (s_end > s_start && isspace(content[s_end - 1]))
         s_end--;
-    return (uint16_t)stoi(content.substr(s_start, s_end - s_start));
+    return (uint16_t)stoi(content.substr(s_start, s_end - s_start)) + 1;
 }
 
 vector<uint32_t> compute_file_hashes(const string &filepath)
@@ -144,22 +160,38 @@ void *worker_thread(void *arg)
             }
             current_filename = pkt.filename;
             out_filepath = "received/recv_" + current_filename;
-            outfile.open(out_filepath, ios::binary | ios::out | ios::trunc);
+            
+            // Check for checkpoint
+            expected_seq_num = load_checkpoint(current_filename);
+            
+            if (expected_seq_num > 1) {
+                outfile.open(out_filepath, ios::binary | ios::out | ios::app);
+                cout << "[WORKER] Resuming receiving " << current_filename << " from seq=" << expected_seq_num << endl;
+            } else {
+                outfile.open(out_filepath, ios::binary | ios::out | ios::trunc);
+            }
+            
             if (!outfile.is_open())
             {
-                cerr << "[WORKER] Cannot create: " << out_filepath << endl;
+                cerr << "[WORKER] Cannot create/open: " << out_filepath << endl;
                 continue;
             }
-            expected_seq_num = 1;
             // Instead of receive_buffer.clear();
             memset(slot_occupied, false, sizeof(slot_occupied));
             connection_init = true;
         }
 
+        // ---- Decrypt -------------------------------------------------------
+        char decrypted_data[DATA_SIZE + 1];
+        if (!aes_decrypt((const uint8_t*)pkt.data, item.compressed_len, SHARED_SECRET_KEY, pkt.iv, (uint8_t*)decrypted_data)) {
+            cerr << "[WORKER] Decrypt failed seq=" << pkt.seq_num << endl;
+            continue;
+        }
+
         // ---- Decompress ----------------------------------------------------
         DecodedPacket decoded;
         decoded.data_len = sizeof(decoded.data);
-        int ret = decompress_data(pkt.data, item.compressed_len,
+        int ret = decompress_data(decrypted_data, item.compressed_len,
                                   decoded.data, decoded.data_len);
         if (ret != 0)
         {
@@ -190,9 +222,10 @@ void *worker_thread(void *arg)
             }
 
             expected_seq_num++;
-            if (expected_seq_num % 1000 == 0)
+            if (expected_seq_num % 100 == 0)
             {
-                save_checkpoint(current_filename, expected_seq_num);
+                uint32_t tc = (decoded.file_size + DATA_SIZE - 1) / DATA_SIZE;
+                save_checkpoint(current_filename, tc, expected_seq_num, slot_occupied);
             }
             // save_checkpoint(current_filename, expected_seq_num);
 
@@ -217,10 +250,11 @@ void *worker_thread(void *arg)
                 }
 
                 // 2. Performance: Batch Checkpointing (Crucial for 1GB!)
-                // Only write to disk (resume.json) every 1000 chunks to save I/O time
-                if (expected_seq_num % 1000 == 0)
+                // Only write to disk (resume.json) every 100 chunks to save I/O time
+                if (expected_seq_num % 100 == 0)
                 {
-                    save_checkpoint(current_filename, expected_seq_num);
+                    uint32_t tc = (bp.file_size + DATA_SIZE - 1) / DATA_SIZE;
+                    save_checkpoint(current_filename, tc, expected_seq_num, slot_occupied);
                 }
 
                 // 3. Mark the end condition
@@ -336,6 +370,18 @@ int main()
 
         if (bytes_recv <= 0)
             continue; // timeout or error — loop again
+            
+        // ----- HMAC Verification -----
+        uint8_t received_hmac[32];
+        memcpy(received_hmac, pkt.hmac, 32);
+        memset(pkt.hmac, 0, 32); // zero for verification
+        
+        if (!verify_hmac((const uint8_t*)&pkt, sizeof(pkt), SHARED_SECRET_KEY, received_hmac)) {
+            cerr << "[SERVER] HMAC VERIFICATION FAILED! Tampering detected. seq=" << ntohs(pkt.seq_num) << endl;
+            continue; // drop packet silently
+        }
+        
+        memcpy(pkt.hmac, received_hmac, 32); // restore
 
         deserialize_packet(&pkt);
 
