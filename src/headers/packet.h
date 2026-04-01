@@ -41,7 +41,7 @@ struct SlimDataPacket
     uint32_t seq_num;      // 4 bytes (Essential for files > 65MB)
     uint32_t crc32;        // 4 bytes (Hardware-accelerated)
     uint16_t data_len;     // 2 bytes (Actual payload size)
-                           // 1 byte  (Always 0)
+                           
     uint8_t flags;         // 1 byte  (Bit 0: Encrypted, Bit 1-2: Stream ID)
     uint16_t reserved;     // 2 bytes (Padding for 4-byte alignment)
     uint32_t chunk_offset; // 4 bytes (Offset within the file)

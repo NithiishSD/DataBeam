@@ -18,13 +18,41 @@
 using namespace std;
 #define BUFFER_SIZE 4096 // Enough for 512 packets in flight (assuming 8KB window)
 #define ACK_BATCH_SIZE 32
+#define RECV_TIMEOUT 1000
+#define SOC_BUFFER 64
 // Work queue — holds CRC-verified raw packets waiting to be decompressed
 struct WorkItem
 {
     SlimDataPacket pkt;
     size_t compressed_len;
 };
+#include <chrono>
+#include <atomic>
+#include <vector>
 
+struct PerfStats
+{
+    // Latency Metrics
+    std::atomic<long long> total_net_recv_time_us{0}; // Time spent in recvfrom
+    std::atomic<long long> total_worker_wait_us{0};   // Time worker spent sleeping/waiting for queue
+    std::atomic<long long> total_decomp_time_us{0};   // Time spent decompressing
+    std::atomic<long long> total_disk_write_us{0};    // Time spent in seekp/write
+
+    // Throughput & Buffer Metrics
+    std::atomic<uint32_t> packets_processed{0};
+    std::atomic<uint32_t> buffer_full_events{0}; // How often queue reached MAX_SIZE
+    std::atomic<uint32_t> crc_fails{0};
+
+    // Function to get current time in microseconds
+    static long long now_us()
+    {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::high_resolution_clock::now().time_since_epoch())
+            .count();
+    }
+};
+
+PerfStats g_perf; // Global performance object
 queue<WorkItem> work_queue;
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
@@ -124,8 +152,9 @@ void *worker_thread(void *arg)
 
     // Use SlimDataPacket as the base for the pool.
     while (!start_received && !server_done)
+    {
         Sleep(1);
-
+    }
     pthread_mutex_lock(&init_mutex);
     string current_filename = shared_filename;
     uint32_t total_file_size = shared_file_size;
@@ -149,12 +178,13 @@ void *worker_thread(void *arg)
 
     while (!server_done)
     {
+        long long wait_start = PerfStats::now_us();
         WorkItem item;
         {
             pthread_mutex_lock(&queue_mutex);
             while (work_queue.empty() && !server_done)
                 pthread_cond_wait(&queue_cond, &queue_mutex);
-
+            g_perf.total_worker_wait_us += (PerfStats::now_us() - wait_start);
             if (server_done && work_queue.empty())
             {
                 pthread_mutex_unlock(&queue_mutex);
@@ -167,15 +197,23 @@ void *worker_thread(void *arg)
 
         // Use the SlimDataPacket structure
         SlimDataPacket &pkt = item.pkt;
+        // ---- Decrypt -------------------------------------------------------
+        char decrypted_data[DATA_SIZE + 1];
+        if (!aes_decrypt((const uint8_t *)pkt.data, item.compressed_len, SHARED_SECRET_KEY, &pkt.packet_iv, (uint8_t *)decrypted_data))
+        {
+            cerr << "[WORKER] Decrypt failed seq=" << pkt.seq_num << endl;
+            continue;
+        }
 
         // ---- 2. DECOMPRESS INTO TEMPORARY BUFFER ---------------------------
         char decompressed_buffer[DATA_SIZE + 1];
         size_t decomp_len = sizeof(decompressed_buffer);
 
         // Only decompress if the compression flag is set in the header
-
-        int ret = decompress_data(pkt.data, item.compressed_len,
+        long long decomp_start = PerfStats::now_us();
+        int ret = decompress_data(decrypted_data, item.compressed_len,
                                   decompressed_buffer, decomp_len);
+        g_perf.total_decomp_time_us += (PerfStats::now_us() - decomp_start);
         if (ret != 0)
         {
             cerr << "[WORKER] Decomp failed seq=" << pkt.seq_num
@@ -188,9 +226,11 @@ void *worker_thread(void *arg)
         // ---- 3. IN-ORDER OR OUT-OF-ORDER LOGIC -----------------------------
         if (pkt.seq_num == expected_seq_num)
         {
+            long long disk_start = PerfStats::now_us();
             size_t write_len = decomp_len; // or pkt.data_len after decompression
             outfile.seekp(pkt.chunk_offset, ios::beg);
             outfile.write(decompressed_buffer, (streamsize)write_len);
+            g_perf.total_disk_write_us += (PerfStats::now_us() - disk_start);
             if (outfile.fail())
             {
                 cerr << "[WORKER] Write failed seq=" << pkt.seq_num << endl;
@@ -198,6 +238,7 @@ void *worker_thread(void *arg)
             }
 
             expected_seq_num++;
+            g_perf.packets_processed++;
             if (expected_seq_num % 500 == 0)
                 save_checkpoint(current_filename, expected_seq_num);
             // 4. DRAIN THE POOL (Selective Repeat)
@@ -208,10 +249,10 @@ void *worker_thread(void *arg)
 
                 if (!slot.occupied || slot.seq_num != expected_seq_num)
                     break;
-
+                long long disk_start = PerfStats::now_us();
                 outfile.seekp(slot.chunk_offset, ios::beg);
                 outfile.write(slot.data, slot.data_len);
-
+                g_perf.total_disk_write_us += (PerfStats::now_us() - disk_start);
                 if (outfile.fail())
                 {
                     cerr << "[WORKER] Write failed buffered seq="
@@ -296,12 +337,12 @@ int main()
     }
 
     // Large socket buffers — absorb bursts without dropping
-    int buf_size = 64 * 1024 * 1024;
+    int buf_size = SOC_BUFFER * 1024 * 1024;
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&buf_size, sizeof(buf_size));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buf_size, sizeof(buf_size));
 
     // FIX: 1ms recv timeout — server must be responsive for ACK sending
-    struct timeval tv = {0, 1000};
+    struct timeval tv = {0, RECV_TIMEOUT};
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
 
     struct sockaddr_in server_addr = {};
@@ -329,12 +370,13 @@ int main()
     // ack_counter: in-order packets received since last batched SACK
     // recv_mark:  recv_mark[seq % BUFFER_SIZE] == seq means that packet is buffered
     uint32_t ack_seq = 1;
-    int      ack_counter = 0;
+    int ack_counter = 0;
     uint32_t recv_mark[BUFFER_SIZE];
     memset(recv_mark, 0, sizeof(recv_mark));
 
     while (is_receiving)
     {
+        long long start_recv = PerfStats::now_us();
         char raw_buffer[sizeof(SlimDataPacket) + 64];
         int bytes_recv = recvfrom(sockfd, raw_buffer, sizeof(raw_buffer), 0, (struct sockaddr *)&client_addr, &addr_len);
         if (bytes_recv <= 0)
@@ -349,9 +391,10 @@ int main()
                 cerr << "[SERVER] Short StartPacket — ignoring" << endl;
                 continue;
             }
-
+            g_perf.total_net_recv_time_us += (PerfStats::now_us() - start_recv);
             StartPacket sp;
             memcpy(&sp, raw_buffer, sizeof(StartPacket));
+
             deserialize_start_packet(&sp);
             pthread_mutex_lock(&init_mutex);
             shared_filename = string(sp.filename);
@@ -401,9 +444,21 @@ int main()
 
             memset(&pkt, 0, sizeof(pkt));
             memcpy(&pkt, raw_buffer, min((size_t)bytes_recv, sizeof(pkt)));
-            // uint32_t received_crc = ntohl(pkt.crc32);
+            // ----- HMAC Verification -----
+            uint8_t received_hmac[16];
+            memcpy(received_hmac, pkt.hmac, 16);
+            memset(pkt.hmac, 0, 16); // zero for verification
+
+            if (!verify_hmac((const uint8_t *)&pkt, sizeof(pkt), SHARED_SECRET_KEY, received_hmac))
+            {
+                cerr << "[SERVER] HMAC VERIFICATION FAILED! Tampering detected. seq=" << ntohs(pkt.seq_num) << endl;
+                continue; // drop packet silently
+            }
+
+            // HMAC verified. pkt.hmac is currently 0 (zeroed for verification).
+            // CRC was computed by the client with hmac[]=0, so we must keep
+            // it zeroed here too — do NOT restore hmac before the CRC check.
             deserialize_slim_packet(&pkt);
-            // uint32_t received_crc = pkt.crc32;
             size_t compressed_len = pkt.data_len;
 
             if (compressed_len == 0 || compressed_len > (size_t)(DATA_SIZE + 1))
@@ -412,20 +467,10 @@ int main()
                      << " seq=" << pkt.seq_num << endl;
                 continue;
             }
-            //  1. Get length safely
 
-            // ---- Validate data_len --------------------------------------------
-
-            //  pkt.crc32 = 0; // Zero out CRC field for calculation (same as client did)
-
-            // ---- Send ACK immediately after length check (before heavy work) --
-            // FIX: ACK sent as small struct, not full Packet — reduces ACK latency
-            // FIX: ACK sent BEFORE decode so the client's RTO doesn't expire
-            //      while we decompress
             // ---- CRC check -------------------------------------------------------
-            // [FIX Bug 1] crc32 sits in the MIDDLE of SlimDataPacket, not at the end.
-            // Cannot exclude it by trimming sizeof(uint32_t) from the tail.
-            // Instead: save the received value, zero the field, hash the full struct.
+            // crc32 sits in the MIDDLE of SlimDataPacket; save, zero, hash, compare.
+            // hmac[] is still 0 here — matches what the client hashed over.
             uint32_t received_crc = pkt.crc32;
             pkt.crc32 = 0;
             uint32_t computed = calculate_crc32(
@@ -433,10 +478,13 @@ int main()
                 sizeof(SlimDataPacket));
             pkt.crc32 = received_crc; // restore for downstream use
 
-            if (computed != pkt.crc32)
+            // Restore hmac AFTER the CRC check (client hashed with hmac=0)
+            memcpy(pkt.hmac, received_hmac, 16);
+
+            if (computed != received_crc)
             {
                 cerr << "[SERVER] CRC FAIL seq=" << pkt.seq_num
-                     << " expected=0x" << hex << pkt.crc32
+                     << " expected=0x" << hex << received_crc
                      << " got=0x" << computed << dec << endl;
                 continue;
             }
@@ -447,9 +495,9 @@ int main()
             if (pkt.seq_num >= ack_seq && pkt.seq_num < ack_seq + BUFFER_SIZE)
                 recv_mark[pkt.seq_num % BUFFER_SIZE] = pkt.seq_num;
 
-            bool hole_detected = (pkt.seq_num > ack_seq);  // gap before this packet
-            bool is_eof        = (pkt.type == 3);          // always ACK immediately
-            bool gap_filled    = false;
+            bool hole_detected = (pkt.seq_num > ack_seq); // gap before this packet
+            bool is_eof = (pkt.type == 3);                // always ACK immediately
+            bool gap_filled = false;
 
             // Advance cumulative watermark if this was the next expected packet
             if (pkt.seq_num == ack_seq)
@@ -482,10 +530,10 @@ int main()
 
                 ACKPacket sack;
                 memset(&sack, 0, sizeof(sack));
-                sack.type    = 1;
-                sack.ack_num = ack_seq;  // cumulative watermark
-                sack.bitmap  = sack_bm;
-                sack.crc32   = calculate_crc32(
+                sack.type = 1;
+                sack.ack_num = ack_seq; // cumulative watermark
+                sack.bitmap = sack_bm;
+                sack.crc32 = calculate_crc32(
                     reinterpret_cast<const unsigned char *>(&sack),
                     sizeof(ACKPacket) - sizeof(uint32_t));
                 serialize_ack_packet(&sack);

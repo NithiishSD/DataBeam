@@ -18,6 +18,12 @@
 #include "./headers/crchw.h"
 #include "./headers/crypto.h"
 #include <filesystem> // C++17
+#include <chrono>
+#include <atomic>
+#include <vector>
+#define BITMAP_ACK 16
+#define SOC_BUFFER 64
+#define RECV_TIMEOUT 200
 using namespace std;
 
 // ----------------------------------------------------------------------------
@@ -44,6 +50,30 @@ volatile bool transfer_complete = false;
 // ----------------------------------------------------------------------------
 // Helper Functions
 // ----------------------------------------------------------------------------
+
+struct PerfStats
+{
+    // Latency Metrics
+    std::atomic<long long> total_net_recv_time_us{0}; // Time spent in recvfrom
+    std::atomic<long long> total_worker_wait_us{0};   // Time worker spent sleeping/waiting for queue
+    std::atomic<long long> total_decomp_time_us{0};   // Time spent decompressing
+    std::atomic<long long> total_disk_write_us{0};    // Time spent in seekp/write
+
+    // Throughput & Buffer Metrics
+    std::atomic<uint32_t> packets_processed{0};
+    std::atomic<uint32_t> buffer_full_events{0}; // How often queue reached MAX_SIZE
+    std::atomic<uint32_t> crc_fails{0};
+
+    // Function to get current time in microseconds
+    static long long now_us()
+    {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::high_resolution_clock::now().time_since_epoch())
+            .count();
+    }
+};
+
+PerfStats g_perf; // Global performance object
 long get_file_size(const char *filename)
 {
     ifstream file(filename, ios::binary | ios::ate);
@@ -128,7 +158,15 @@ void *sender_thread(void *arg)
         // --- 2. BUILD THE SLIM DATA PACKET ---
         struct SlimDataPacket slim_pkt;
         memset(&slim_pkt, 0, sizeof(slim_pkt));
+        generate_iv(&(slim_pkt.packet_iv));
 
+        char encrypted_data[DATA_SIZE + 1];
+        if (!aes_encrypt((const uint8_t *)compressed_data, compressed_len, SHARED_SECRET_KEY, &slim_pkt.packet_iv, (uint8_t *)encrypted_data))
+        {
+            cerr << " Encryption failed!" << endl;
+            transfer_complete = true;
+            break;
+        }
         slim_pkt.type = (current_offset + bytes_read >= (uint32_t)file_size) ? 3 : 0;
         slim_pkt.seq_num = seq;                 // Now 32-bit
         slim_pkt.chunk_offset = current_offset; // [FIX Bug 6] was accidentally commented out
@@ -137,10 +175,10 @@ void *sender_thread(void *arg)
         // Use the flags byte to signal compression (Bit 0)
         slim_pkt.flags = is_compressed ? 0x01 : 0x00;
 
-        // Zero out the Security Fields for now
-        slim_pkt.packet_iv = 0;
+        // packet_iv was set by generate_iv() above — do NOT zero it here.
+        // The server needs the IV to decrypt; zeroing it makes decryption produce garbage.
         memset(slim_pkt.hmac, 0, 16);
-        memcpy(slim_pkt.data, compressed_data, compressed_len);
+        memcpy(slim_pkt.data, encrypted_data, compressed_len);
         struct SlimDataPacket pkt_send = slim_pkt;
 
         // --- 3. COMPUTE CRC ---
@@ -159,6 +197,13 @@ void *sender_thread(void *arg)
 
         // --- 4. SERIALIZE AND SEND ---
         serialize_slim_packet(&pkt_send); // byte-swaps in place for the wire
+        // HMAC is computed on the fully serialized (network-byte-order) packet.
+        // hmac[] is 16 bytes — memset/memcpy must use exactly 16, NOT 32.
+        // Using 32 would overflow into data[0..15], corrupting the payload
+        // and invalidating the CRC that was computed above.
+        memset(pkt_send.hmac, 0, 16);
+        generate_hmac((const uint8_t *)&pkt_send, sizeof(pkt_send), SHARED_SECRET_KEY, pkt_send.hmac);
+        memcpy(pkt_for_arq.hmac, pkt_send.hmac, 16);
         int bytes_sent = sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
                                 (struct sockaddr *)&server_addr, addr_len);
         if (bytes_sent > 0)
@@ -220,14 +265,14 @@ void *receiver_thread(void *arg)
                     continue;
                 pthread_mutex_lock(&arq_mutex);
 
-                uint32_t cum     = ack_pkt.ack_num;  // cumulative watermark (server's next expected seq)
-                uint16_t sack_bm = ack_pkt.bitmap;   // bit i = server has packet (cum + i)
+                uint32_t cum = ack_pkt.ack_num;    // cumulative watermark (server's next expected seq)
+                uint16_t sack_bm = ack_pkt.bitmap; // bit i = server has packet (cum + i)
 
                 // 1. Slide the window: bulk-free all RAM for packets below the watermark
                 arq.handle_cumulative_ack(cum);
 
                 // 2. Mark bitmap-confirmed out-of-order packets as individually acked
-                for (int i = 0; i < 16; i++)
+                for (int i = 0; i < BITMAP_ACK; i++)
                 {
                     if (sack_bm & (1u << i))
                         arq.mark_packet_acked(cum + (uint32_t)i);
@@ -243,11 +288,15 @@ void *receiver_thread(void *arg)
                 int highest_bit = -1;
                 for (int i = 15; i >= 0; i--)
                 {
-                    if (sack_bm & (1u << i)) { highest_bit = i; break; }
+                    if (sack_bm & (1u << i))
+                    {
+                        highest_bit = i;
+                        break;
+                    }
                 }
 
                 uint32_t fast_retransmit_seqs[16];
-                int      fast_retransmit_count = 0;
+                int fast_retransmit_count = 0;
                 for (int i = 0; i < highest_bit; i++)
                 {
                     if (!(sack_bm & (1u << i)))
@@ -418,8 +467,8 @@ int main(int argc, char *argv[])
     // 50ms receive timeout so receiver_thread doesn't block forever
     struct timeval tv;
     tv.tv_sec = 0;
-    tv.tv_usec = 200 * 1000;            // changed to 200ms to better accommodate SR's per-packet timeouts and avoid excessive looping on recvfrom
-    int buffer_size = 64 * 1024 * 1024; // 16 MB
+    tv.tv_usec = RECV_TIMEOUT * 1000;            // changed to 200ms to better accommodate SR's per-packet timeouts and avoid excessive looping on recvfrom
+    int buffer_size = SOC_BUFFER * 1024 * 1024; // 16 MB
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&buffer_size, sizeof(buffer_size));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buffer_size, sizeof(buffer_size));
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
@@ -482,7 +531,7 @@ int main(int argc, char *argv[])
     start_pkt.type = 2;
     start_pkt.file_size = file_size;
     start_pkt.total_chunks = total_chunks;
-    strncpy(start_pkt.filename, filename.c_str(), 256);
+    strncpy(start_pkt.filename, filename.c_str(), MAX_FILENAME);
     serialize_start_packet(&start_pkt);
     sendto(sockfd, (const char *)&start_pkt, sizeof(start_pkt), 0, (struct sockaddr *)&server_addr, addr_len);
     cout << "[CLIENT] Waiting for server handshake..." << endl;
@@ -553,5 +602,5 @@ int main(int argc, char *argv[])
     cout << "   - Throughput:               " << throughput << " Mbps" << endl;
     cout << "   - Max in-flight packets:    " << total_inflights << endl;
     cout << "   - Total retransmissions:    " << retransmissions << endl;
-    return 0;
+   
 }
