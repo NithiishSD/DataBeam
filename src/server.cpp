@@ -17,6 +17,7 @@
 #include "./headers/crypto.h"
 using namespace std;
 #define BUFFER_SIZE 4096 // Enough for 512 packets in flight (assuming 8KB window)
+#define ACK_BATCH_SIZE 32
 // Work queue — holds CRC-verified raw packets waiting to be decompressed
 struct WorkItem
 {
@@ -323,6 +324,15 @@ int main()
 
     bool is_receiving = true;
 
+    // --- Hybrid SACK state ---
+    // ack_seq:    cumulative watermark — the next in-order seq the server needs
+    // ack_counter: in-order packets received since last batched SACK
+    // recv_mark:  recv_mark[seq % BUFFER_SIZE] == seq means that packet is buffered
+    uint32_t ack_seq = 1;
+    int      ack_counter = 0;
+    uint32_t recv_mark[BUFFER_SIZE];
+    memset(recv_mark, 0, sizeof(recv_mark));
+
     while (is_receiving)
     {
         char raw_buffer[sizeof(SlimDataPacket) + 64];
@@ -431,17 +441,61 @@ int main()
                 continue;
             }
 
-            // Convert header fields to host byte order for easier processing
+            // --- Hybrid SACK: track, decide, and send ---
+
+            // Mark this packet as received in the tracking table
+            if (pkt.seq_num >= ack_seq && pkt.seq_num < ack_seq + BUFFER_SIZE)
+                recv_mark[pkt.seq_num % BUFFER_SIZE] = pkt.seq_num;
+
+            bool hole_detected = (pkt.seq_num > ack_seq);  // gap before this packet
+            bool is_eof        = (pkt.type == 3);          // always ACK immediately
+            bool gap_filled    = false;
+
+            // Advance cumulative watermark if this was the next expected packet
+            if (pkt.seq_num == ack_seq)
             {
-                ACKPacket small_ack;
-                small_ack.type = 1;
-                small_ack.ack_num = pkt.seq_num;
-                small_ack.bitmap = (uint16_t)(1u << (pkt.seq_num % 16));
-                small_ack.crc32 = calculate_crc32((unsigned char *)&small_ack, sizeof(small_ack) - 4);
-                serialize_ack_packet(&small_ack);
-                // serialize_packet(&small_ack);
-                sendto(sockfd, (const char *)&small_ack, sizeof(small_ack), 0,
+                uint32_t before = ack_seq;
+                while (recv_mark[ack_seq % BUFFER_SIZE] == ack_seq)
+                {
+                    recv_mark[ack_seq % BUFFER_SIZE] = 0;
+                    ack_seq++;
+                }
+                // If ack_seq jumped by more than 1, we consumed pre-buffered
+                // out-of-order packets — a previously signalled hole is now filled
+                gap_filled = (ack_seq > before + 1);
+                ack_counter++;
+            }
+
+            bool send_sack = hole_detected || is_eof || gap_filled ||
+                             (ack_counter >= ACK_BATCH_SIZE);
+
+            if (send_sack)
+            {
+                // Build SACK bitmap: bit i = 1 if (ack_seq + i) already buffered
+                uint16_t sack_bm = 0;
+                for (int i = 0; i < 16; i++)
+                {
+                    uint32_t c = ack_seq + (uint32_t)i;
+                    if (recv_mark[c % BUFFER_SIZE] == c)
+                        sack_bm |= (uint16_t)(1u << i);
+                }
+
+                ACKPacket sack;
+                memset(&sack, 0, sizeof(sack));
+                sack.type    = 1;
+                sack.ack_num = ack_seq;  // cumulative watermark
+                sack.bitmap  = sack_bm;
+                sack.crc32   = calculate_crc32(
+                    reinterpret_cast<const unsigned char *>(&sack),
+                    sizeof(ACKPacket) - sizeof(uint32_t));
+                serialize_ack_packet(&sack);
+                sendto(sockfd, (const char *)&sack, sizeof(sack), 0,
                        (struct sockaddr *)&client_addr, addr_len);
+
+                // Only reset the batch counter for normal batched SACKs;
+                // hole/gap SACKs don't drain the counter so batching continues.
+                if (!hole_detected && !gap_filled)
+                    ack_counter = 0;
             }
             {
                 WorkItem item;

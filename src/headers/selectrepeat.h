@@ -14,9 +14,10 @@
 #include <cstring>
 
 // Constants for Selective Repeat ARQ
-#define SR_WINDOW_SIZE 1024     // Sliding window size (N=8)
-#define SR_PACKET_TIMEOUT_MS 50 // Individual packet timeout: 500ms
+#define SR_WINDOW_SIZE 1024     // Sliding window size
+#define SR_PACKET_TIMEOUT_MS 50 // Individual packet timeout (ms)
 #define SR_MAX_RETRANSMITS 200  // Max retransmit attempts per packet
+#define ACK_BATCH_SIZE 10       // Server sends SACK every N in-order packets
 
 // Structure to wrap Packet with timeout tracking for SR ARQ
 struct WindowPacket
@@ -75,6 +76,12 @@ public:
     // === ACK Processing ===
     // Handle individual ACK for a specific packet (not cumulative)
     void handle_ack(uint32_t ack_num);
+
+    // Hybrid SACK: slide the window to cum_ack in one shot.
+    // Erases all buffered packets with seq < cum_ack, advances send_base,
+    // and resets the ack_bitmap so the caller can re-populate it via
+    // mark_packet_acked() for any bitmap-indicated out-of-order packets.
+    void handle_cumulative_ack(uint32_t cum_ack);
 
     // Mark packet as acknowledged
     void mark_packet_acked(uint32_t seq_num);

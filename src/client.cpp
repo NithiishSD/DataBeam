@@ -219,22 +219,61 @@ void *receiver_thread(void *arg)
                 if (ack_pkt.ack_num == 0)
                     continue;
                 pthread_mutex_lock(&arq_mutex);
-                // [CHANGED] SR uses individual ACKs per seq_num (not cumulative)
-                arq.handle_ack(ack_pkt.ack_num);
+
+                uint32_t cum     = ack_pkt.ack_num;  // cumulative watermark (server's next expected seq)
+                uint16_t sack_bm = ack_pkt.bitmap;   // bit i = server has packet (cum + i)
+
+                // 1. Slide the window: bulk-free all RAM for packets below the watermark
+                arq.handle_cumulative_ack(cum);
+
+                // 2. Mark bitmap-confirmed out-of-order packets as individually acked
+                for (int i = 0; i < 16; i++)
+                {
+                    if (sack_bm & (1u << i))
+                        arq.mark_packet_acked(cum + (uint32_t)i);
+                }
+                arq.advance_window();
                 acks_received++;
 
-                // cout << " ACK for seq=" << ack_pkt.ack_num
-                //     << " | in-flight=" <<   endl;
                 if (arq.get_in_flight_count() > 1000)
-                {
                     total_inflights++;
-                }
-                // Transfer done when all data sent and window fully drained
-                if (chunk_offset >= (uint32_t)file_size && arq.get_in_flight_count() == 0)
+
+                // 3. Fast retransmit: scan bitmap for holes below the highest received bit
+                //    e.g. bitmap = 0b1101 → cum+0, cum+2 received; cum+1 is a hole → retransmit now
+                int highest_bit = -1;
+                for (int i = 15; i >= 0; i--)
                 {
-                    transfer_complete = true;
+                    if (sack_bm & (1u << i)) { highest_bit = i; break; }
                 }
+
+                uint32_t fast_retransmit_seqs[16];
+                int      fast_retransmit_count = 0;
+                for (int i = 0; i < highest_bit; i++)
+                {
+                    if (!(sack_bm & (1u << i)))
+                        fast_retransmit_seqs[fast_retransmit_count++] = cum + (uint32_t)i;
+                }
+
+                // 4. Check transfer completion
+                if (chunk_offset >= (uint32_t)file_size && arq.get_in_flight_count() == 0)
+                    transfer_complete = true;
+
                 pthread_mutex_unlock(&arq_mutex);
+
+                // 5. Fast retransmit outside the lock — prepare_retransmit re-acquires
+                //    window_mutex internally, no deadlock with arq_mutex.
+                for (int i = 0; i < fast_retransmit_count; i++)
+                {
+                    SlimDataPacket rpkt;
+                    if (arq.prepare_retransmit(fast_retransmit_seqs[i], rpkt))
+                    {
+                        SlimDataPacket pkt_send = rpkt;
+                        serialize_slim_packet(&pkt_send);
+                        sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
+                               (struct sockaddr *)&server_addr, addr_len);
+                        retransmissions++;
+                    }
+                }
             }
             else
             {

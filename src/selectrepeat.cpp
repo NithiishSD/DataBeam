@@ -92,6 +92,34 @@ void SelectiveRepeatARQ::handle_ack(uint32_t ack_num)
     advance_window();
 }
 
+// Hybrid SACK: slide the window to cum_ack in one bulk operation.
+// All buffered packets with seq < cum_ack are implicitly acknowledged and freed.
+// The ack_bitmap is reset because it is relative to send_base; the caller
+// re-populates it via mark_packet_acked() for any SACK bitmap-indicated packets.
+void SelectiveRepeatARQ::handle_cumulative_ack(uint32_t cum_ack)
+{
+    pthread_mutex_lock(&window_mutex);
+
+    if (cum_ack <= send_base)
+    {
+        // Already past this point — duplicate/stale ACK, nothing to do
+        pthread_mutex_unlock(&window_mutex);
+        return;
+    }
+
+    // Erase every buffered packet covered by the cumulative ACK
+    auto it = window_buffer.begin();
+    while (it != window_buffer.end() && it->first < cum_ack)
+        it = window_buffer.erase(it);
+
+    // Snap send_base forward and reset bitmap (now relative to new send_base)
+    send_base = cum_ack;
+    ack_bitmap.reset();
+
+    pthread_mutex_unlock(&window_mutex);
+}
+
+
 // Mark a specific packet as acknowledged
 void SelectiveRepeatARQ::mark_packet_acked(uint32_t seq_num)
 {
