@@ -176,6 +176,14 @@ void *worker_thread(void *arg)
     memset(pool, 0, sizeof(PoolSlot) * BUFFER_SIZE);
     uint32_t expected_seq_num = 1; // [CRITICAL] Must be 32-bit for 1GB files
 
+    // ── Staging bunch buffer (1 MB) ──────────────────────────────────────────
+    // Contiguous decompressed packets are accumulated here; a single seekp+write
+    // fires per bunch instead of per packet (~32× fewer disk syscalls per burst).
+    static const size_t BUNCH_CAPACITY = 1u * 1024u * 1024u; // 1 MB
+    char    *bunch_buffer       = new char[BUNCH_CAPACITY];
+    size_t   bunch_size         = 0;         // bytes staged in bunch_buffer
+    uint64_t bunch_start_offset = 0;         // file offset of bunch_buffer[0]
+
     while (!server_done)
     {
         long long wait_start = PerfStats::now_us();
@@ -227,59 +235,79 @@ void *worker_thread(void *arg)
         // ---- 3. IN-ORDER OR OUT-OF-ORDER LOGIC -----------------------------
         if (pkt.seq_num == expected_seq_num)
         {
-            long long disk_start = PerfStats::now_us();
-            size_t write_len = decomp_len; // or pkt.data_len after decompression
-            outfile.seekp(pkt.chunk_offset, ios::beg);
-            outfile.write(decompressed_buffer, (streamsize)write_len);
-            g_perf.total_disk_write_us += (PerfStats::now_us() - disk_start);
-            if (outfile.fail())
+            // ── Start a new bunch at the trigger packet's file offset ─────
+            bunch_start_offset = pkt.chunk_offset;
+            bunch_size         = 0;
+
+            // Helper lambda: flush the current bunch in one seekp+write.
+            // Defined as a local variable (C++11 generic lambda with captures).
+            auto flush_bunch = [&]() -> bool
             {
-                cerr << "[WORKER] Write failed seq=" << pkt.seq_num << endl;
-                outfile.clear();
-            }
+                if (bunch_size == 0)
+                    return true;
+                long long disk_start = PerfStats::now_us();
+                outfile.seekp((streamoff)bunch_start_offset, ios::beg);
+                outfile.write(bunch_buffer, (streamsize)bunch_size);
+                g_perf.total_disk_write_us += (PerfStats::now_us() - disk_start);
+                if (outfile.fail())
+                {
+                    cerr << "[WORKER] Bunch write failed at offset="
+                         << bunch_start_offset << endl;
+                    outfile.clear();
+                    return false;
+                }
+                bunch_size = 0;
+                return true;
+            };
+
+            // Stage the trigger (in-order) packet.
+            if (bunch_size + decomp_len > BUNCH_CAPACITY)
+                flush_bunch(); // shouldn't happen on the first packet, but guard it
+            memcpy(bunch_buffer + bunch_size, decompressed_buffer, decomp_len);
+            bunch_size += decomp_len;
 
             expected_seq_num++;
 
-            if (expected_seq_num % 500 == 0)
-                save_checkpoint(current_filename, expected_seq_num);
-            // 4. DRAIN THE POOL (Selective Repeat)
-            while (true)
+            bool hit_eof = (pkt.type == 3);
+
+            // ── 4. DRAIN THE POOL — accumulate into bunch, flush when full ─
+            while (!hit_eof)
             {
                 int idx = expected_seq_num % BUFFER_SIZE;
                 PoolSlot &slot = pool[idx];
 
                 if (!slot.occupied || slot.seq_num != expected_seq_num)
                     break;
-                long long disk_start = PerfStats::now_us();
-                outfile.seekp(slot.chunk_offset, ios::beg);
-                outfile.write(slot.data, slot.data_len);
-                g_perf.total_disk_write_us += (PerfStats::now_us() - disk_start);
-                if (outfile.fail())
+
+                hit_eof = (slot.type == 3);
+
+                // If this slot's data would overflow the bunch, flush first.
+                if (bunch_size + slot.data_len > BUNCH_CAPACITY)
                 {
-                    cerr << "[WORKER] Write failed buffered seq="
-                         << expected_seq_num << endl;
-                    outfile.clear();
-                    break;
+                    if (!flush_bunch())
+                        break; // write error — stop draining
+                    // New bunch starts at this slot's file offset.
+                    bunch_start_offset = slot.chunk_offset;
                 }
 
-                bool is_end = (slot.type == 3);
+                memcpy(bunch_buffer + bunch_size, slot.data, slot.data_len);
+                bunch_size += slot.data_len;
+
                 slot.occupied = false;
                 expected_seq_num++;
+
                 if (expected_seq_num % 500 == 0)
                     save_checkpoint(current_filename, expected_seq_num);
-
-                if (is_end)
-                {
-                    outfile.flush();
-                    outfile.close();
-                    remove("resume.json");
-                    cout << "[WORKER] Transfer complete: " << out_filepath << endl;
-                    server_done = true;
-                    goto cleanup;
-                }
             }
-            // END on in-order path
-            if (pkt.type == 3)
+
+            // ── Flush remaining partial bunch ─────────────────────────────
+            flush_bunch();
+
+            if (expected_seq_num % 500 == 0)
+                save_checkpoint(current_filename, expected_seq_num);
+
+            // ── EOF: close file and signal done ───────────────────────────
+            if (hit_eof || pkt.type == 3)
             {
                 outfile.flush();
                 outfile.close();
@@ -312,9 +340,11 @@ void *worker_thread(void *arg)
     }
 cleanup:
     delete[] pool;
+    delete[] bunch_buffer;
     cout << "[WORKER] Worker thread exiting." << endl;
     return nullptr;
 }
+
 
 int main()
 {

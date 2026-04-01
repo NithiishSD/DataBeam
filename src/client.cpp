@@ -145,7 +145,7 @@ bool read_file_chunk(const char *filename, uint32_t offset, char *buffer, size_t
 //   • One trailing lock acquisition commits all pkts_built to the ARQ buffer.
 // ----------------------------------------------------------------------------
 
-#define BURST_SIZE 32   // packets per burst cycle
+#define BURST_SIZE 34 // packets per burst cycle
 
 void *sender_thread(void *arg)
 {
@@ -163,19 +163,19 @@ void *sender_thread(void *arg)
     // arq_pkts:  host-byte-order packets with CRC stored in the ARQ retransmit buffer
     SlimDataPacket wire_pkts[BURST_SIZE];
     SlimDataPacket arq_pkts[BURST_SIZE];
-    WSABUF         wsabufs[BURST_SIZE];
+    WSABUF wsabufs[BURST_SIZE];
 
     while (!transfer_complete)
     {
         // ── 1. Snapshot ARQ state (one lock for the whole batch check) ──────
         pthread_mutex_lock(&arq_mutex);
-        int      in_flight    = arq.get_in_flight_count(); // acquires window_mutex internally
+        int in_flight = arq.get_in_flight_count(); // acquires window_mutex internally
         uint32_t start_offset = chunk_offset;
-        uint32_t base_seq     = arq.get_next_seq_num();
+        uint32_t base_seq = arq.get_next_seq_num();
         pthread_mutex_unlock(&arq_mutex);
 
-        bool has_data   = (start_offset < (uint32_t)file_size);
-        int  free_slots = SR_WINDOW_SIZE - in_flight;
+        bool has_data = (start_offset < (uint32_t)file_size);
+        int free_slots = SR_WINDOW_SIZE - in_flight;
 
         if (!has_data || free_slots <= 0)
         {
@@ -187,9 +187,9 @@ void *sender_thread(void *arg)
         int batch_size = (free_slots < BURST_SIZE) ? free_slots : BURST_SIZE;
 
         // ── 2. Build batch outside the lock ───────────────────────────────
-        int      pkts_built       = 0;
-        uint32_t cur_offset       = start_offset;
-        size_t   batch_bytes_read = 0;
+        int pkts_built = 0;
+        uint32_t cur_offset = start_offset;
+        size_t batch_bytes_read = 0;
 
         for (int b = 0; b < batch_size && cur_offset < (uint32_t)file_size; b++)
         {
@@ -202,9 +202,9 @@ void *sender_thread(void *arg)
                 break;
 
             // 2b. Compress
-            char   compressed_data[DATA_SIZE + 1];
-            size_t compressed_len  = sizeof(compressed_data);
-            bool   is_compressed   = false;
+            char compressed_data[DATA_SIZE + 1];
+            size_t compressed_len = sizeof(compressed_data);
+            bool is_compressed = false;
 
             if (compress_data(chunk_data, bytes_read, compressed_data, compressed_len) == 0)
             {
@@ -213,15 +213,15 @@ void *sender_thread(void *arg)
             else
             {
                 memcpy(compressed_data + 1, chunk_data, bytes_read);
-                compressed_data[0] = 0x00;  // raw marker
-                compressed_len     = bytes_read + 1;
+                compressed_data[0] = 0x00; // raw marker
+                compressed_len = bytes_read + 1;
             }
 
             // 2c. Build packet header (zero-copy: only update changing fields per burst)
             SlimDataPacket &arq_pkt = arq_pkts[b];
             memset(&arq_pkt, 0, sizeof(arq_pkt));
 
-            generate_iv(&arq_pkt.packet_iv);   // unique IV per packet — MUST NOT be zeroed
+            generate_iv(&arq_pkt.packet_iv); // unique IV per packet — MUST NOT be zeroed
 
             // 2d. Encrypt compressed payload
             char encrypted_data[DATA_SIZE + 1];
@@ -236,11 +236,11 @@ void *sender_thread(void *arg)
 
             bool is_last = (cur_offset + bytes_read >= (uint32_t)file_size);
 
-            arq_pkt.type         = is_last ? 3 : 0;
-            arq_pkt.seq_num      = base_seq + (uint32_t)b;
+            arq_pkt.type = is_last ? 3 : 0;
+            arq_pkt.seq_num = base_seq + (uint32_t)b;
             arq_pkt.chunk_offset = cur_offset;
-            arq_pkt.data_len     = (uint16_t)compressed_len;
-            arq_pkt.flags        = is_compressed ? 0x01 : 0x00;
+            arq_pkt.data_len = (uint16_t)compressed_len;
+            arq_pkt.flags = is_compressed ? 0x01 : 0x00;
             memset(arq_pkt.hmac, 0, 16);
             memcpy(arq_pkt.data, encrypted_data, compressed_len);
 
@@ -252,24 +252,25 @@ void *sender_thread(void *arg)
 
             // 2f. Wire copy: serialize (byte-swap) then compute HMAC
             SlimDataPacket &wire = wire_pkts[b];
-            wire = arq_pkt;                       // copy host-order packet (with CRC)
-            serialize_slim_packet(&wire);          // byte-swap in place for the wire
+            wire = arq_pkt;               // copy host-order packet (with CRC)
+            serialize_slim_packet(&wire); // byte-swap in place for the wire
             // hmac[] is 16 bytes — memset MUST be exactly 16 (not 32) to avoid
             // overflowing into data[] and invalidating the CRC just computed.
             memset(wire.hmac, 0, 16);
             generate_hmac((const uint8_t *)&wire, sizeof(wire),
                           SHARED_SECRET_KEY, wire.hmac);
-            memcpy(arq_pkt.hmac, wire.hmac, 16);  // keep ARQ copy consistent
+            memcpy(arq_pkt.hmac, wire.hmac, 16); // keep ARQ copy consistent
 
             // 2g. Set up WSABUF — points directly into wire_pkts[] (zero copy)
             wsabufs[b].buf = reinterpret_cast<CHAR *>(&wire);
             wsabufs[b].len = sizeof(wire);
 
-            cur_offset       += bytes_read;
+            cur_offset += bytes_read;
             batch_bytes_read += bytes_read;
             pkts_built++;
 
-            if (is_last) break;
+            if (is_last)
+                break;
         }
 
         if (pkts_built == 0)
@@ -315,10 +316,10 @@ void *sender_thread(void *arg)
         for (int b = 0; b < pkts_sent; b++)
         {
             arq.record_sent_packet(arq_pkts[b]); // host-order copy, correct CRC
-            arq.increment_seq_num();              // advance next_seq_num by 1
+            arq.increment_seq_num();             // advance next_seq_num by 1
         }
-        chunk_offset     += batch_bytes_read;
-        chunks_sent      += pkts_sent;
+        chunk_offset += batch_bytes_read;
+        chunks_sent += pkts_sent;
         total_bytes_sent += batch_bytes_read;
         pthread_mutex_unlock(&arq_mutex);
     }
@@ -327,8 +328,6 @@ sender_abort:
     infile.close();
     return nullptr;
 }
-
-
 
 // ----------------------------------------------------------------------------
 // Thread 2: Receiver Thread
