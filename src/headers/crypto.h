@@ -10,18 +10,18 @@
 extern const uint8_t SHARED_SECRET_KEY[16];
 
 // Generate 16 bytes of random IV
-void generate_iv(uint8_t *iv);
+void generate_iv(uint64_t *iv);
 
 // Encrypt plaintext using AES-128-CTR
 // Returns true on success
 bool aes_encrypt(const uint8_t *plaintext, size_t plaintext_len,
-                 const uint8_t *key, const uint8_t *iv,
+                 const uint8_t *key, const uint64_t *iv,
                  uint8_t *ciphertext);
 
 // Decrypt ciphertext using AES-128-CTR
 // Returns true on success
 bool aes_decrypt(const uint8_t *ciphertext, size_t ciphertext_len,
-                 const uint8_t *key, const uint8_t *iv,
+                 const uint8_t *key, const uint64_t *iv,
                  uint8_t *plaintext);
 
 // Generate HMAC-SHA256 over the provided packet data

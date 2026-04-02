@@ -17,7 +17,17 @@
 #include "./headers/compress.h"
 #include "./headers/crchw.h"
 #include "./headers/crypto.h"
+#include "./headers/ringbuf.h"
 #include <filesystem> // C++17
+#include <chrono>
+#include <atomic>
+#include <vector>
+#define BITMAP_ACK 64
+#define SOC_BUFFER 64
+#define RECV_TIMEOUT 30
+#define BITMAP_SIZE 64
+// Number of compressor threads — tune to CPU core count
+#define COMPRESSOR_THREADS 4 // increase to 8 on 8+ core machines
 using namespace std;
 
 // ----------------------------------------------------------------------------
@@ -44,6 +54,67 @@ volatile bool transfer_complete = false;
 // ----------------------------------------------------------------------------
 // Helper Functions
 // ----------------------------------------------------------------------------
+
+// ---- Pipeline packet structs -----------------------------------------------
+
+struct RawChunk
+{
+    char data[DATA_SIZE];
+    size_t bytes_read;
+    uint32_t offset;
+    uint32_t seq_num;
+    bool is_last;
+};
+
+struct ReadyPacket
+{
+    SlimDataPacket pkt; // fully built, ready to sendto()
+    size_t wire_len;    // actual bytes to send (sizeof pkt always, but tracked)
+};
+
+// ---- Pipeline queues -------------------------------------------------------
+// Raw queue: dispatcher → compressor threads (SPMC: one dispatcher, N compressors)
+// Ready queue: compressor threads → sender thread (MPSC: N compressors, one sender)
+
+static const size_t RAW_Q_CAP = 4096;
+static const size_t READY_Q_CAP = 4096;
+
+// Raw queue uses mutex push (multiple compressors pop, one dispatcher pushes)
+RingBuf<RawChunk, RAW_Q_CAP> raw_queue;
+pthread_mutex_t raw_pop_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Ready queue uses mutex push (multiple compressors push, one sender pops)
+MPRingBuf<ReadyPacket, READY_Q_CAP> ready_queue;
+
+// Dispatcher state
+atomic<uint32_t> dispatch_offset{0};
+atomic<uint32_t> dispatch_seq{1};
+atomic<bool> dispatch_done{false};
+
+struct PerfStats
+{
+    // Latency Metrics
+    atomic<long long> total_net_recv_time_us{0}; // Time spent in recvfrom
+    atomic<long long> total_worker_wait_us{0};   // Time worker spent sleeping/waiting for queue
+    atomic<long long> total_decomp_time_us{0};   // Time spent decompressing
+    atomic<long long> total_disk_write_us{0};    // Time spent in seekp/write
+
+    // Throughput & Buffer Metrics
+    atomic<uint32_t> packets_processed{0};
+    atomic<uint32_t> buffer_full_events{0}; // How often queue reached MAX_SIZE
+    atomic<uint32_t> crc_fails{0};
+
+    // Function to get current time in microseconds
+    static long long now_us()
+    {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::high_resolution_clock::now().time_since_epoch())
+            .count();
+    }
+};
+
+PerfStats g_perf; // Global performance object
+
 long get_file_size(const char *filename)
 {
     ifstream file(filename, ios::binary | ios::ate);
@@ -64,132 +135,197 @@ bool read_file_chunk(const char *filename, uint32_t offset, char *buffer, size_t
 }
 
 // ----------------------------------------------------------------------------
-// Thread 1: Sender Thread
+// Thread 1: Sender Thread — Burst / Batch Mode
+//
+// Architecture:
+//   • One lock snapshot per burst (not per packet) to read ARQ state.
+//   • Packets are fully built (read → compress → encrypt → CRC → serialize → HMAC)
+//     outside any mutex, maximising CPU utilisation on the hot path.
+//   • WSASendTo loop flushes the whole burst before yielding to the OS.
+//   • One trailing lock acquisition commits all pkts_built to the ARQ buffer.
 // ----------------------------------------------------------------------------
+
+#define BURST_SIZE 34 // packets per burst cycle
+
 void *sender_thread(void *arg)
 {
+    // Persistent file handle — avoids reopening the file BURST_SIZE times per cycle.
+    ifstream infile(filename_str, ios::binary);
+    if (!infile.is_open())
+    {
+        cerr << " [SENDER] Cannot open file: " << filename_str << endl;
+        transfer_complete = true;
+        return nullptr;
+    }
+
+    // Per-burst packet arrays (stack-allocated, ~96 KB — well within the 1 MB stack limit)
+    // wire_pkts: serialized network-byte-order packets sent via WSASendTo
+    // arq_pkts:  host-byte-order packets with CRC stored in the ARQ retransmit buffer
+    SlimDataPacket wire_pkts[BURST_SIZE];
+    SlimDataPacket arq_pkts[BURST_SIZE];
+    WSABUF wsabufs[BURST_SIZE];
+
     while (!transfer_complete)
     {
+        // ── 1. Snapshot ARQ state (one lock for the whole batch check) ──────
         pthread_mutex_lock(&arq_mutex);
-        bool can_send = (chunk_offset < (uint32_t)file_size && arq.can_send_packet());
+        int in_flight = arq.get_in_flight_count(); // acquires window_mutex internally
+        uint32_t start_offset = chunk_offset;
+        uint32_t base_seq = arq.get_next_seq_num();
         pthread_mutex_unlock(&arq_mutex);
 
-        if (!can_send)
+        bool has_data = (start_offset < (uint32_t)file_size);
+        int free_slots = SR_WINDOW_SIZE - in_flight;
+
+        if (!has_data || free_slots <= 0)
         {
-            // Sleep(1);
+            Sleep(1);
             continue;
         }
 
-        pthread_mutex_lock(&arq_mutex);
-        // Re-check under lock (TOCTOU guard)
-        if (!(chunk_offset < (uint32_t)file_size && arq.can_send_packet()))
+        // Congestion-aware batch size: never overfill the window.
+        int batch_size = (free_slots < BURST_SIZE) ? free_slots : BURST_SIZE;
+
+        // ── 2. Build batch outside the lock ───────────────────────────────
+        int pkts_built = 0;
+        uint32_t cur_offset = start_offset;
+        size_t batch_bytes_read = 0;
+
+        for (int b = 0; b < batch_size && cur_offset < (uint32_t)file_size; b++)
         {
-            pthread_mutex_unlock(&arq_mutex);
+            // 2a. Read chunk using the persistent handle (no open/close overhead)
+            char chunk_data[DATA_SIZE];
+            infile.seekg(cur_offset);
+            infile.read(chunk_data, DATA_SIZE);
+            size_t bytes_read = (size_t)infile.gcount();
+            if (bytes_read == 0)
+                break;
+
+            // 2b. Compress
+            char compressed_data[DATA_SIZE + 1];
+            size_t compressed_len = sizeof(compressed_data);
+            bool is_compressed = false;
+
+            if (compress_data(chunk_data, bytes_read, compressed_data, compressed_len) == 0)
+            {
+                is_compressed = ((uint8_t)compressed_data[0] == 0x01);
+            }
+            else
+            {
+                memcpy(compressed_data + 1, chunk_data, bytes_read);
+                compressed_data[0] = 0x00; // raw marker
+                compressed_len = bytes_read + 1;
+            }
+
+            // 2c. Build packet header (zero-copy: only update changing fields per burst)
+            SlimDataPacket &arq_pkt = arq_pkts[b];
+            memset(&arq_pkt, 0, sizeof(arq_pkt));
+
+            generate_iv(&arq_pkt.packet_iv); // unique IV per packet — MUST NOT be zeroed
+
+            // 2d. Encrypt compressed payload
+            char encrypted_data[DATA_SIZE + 1];
+            if (!aes_encrypt((const uint8_t *)compressed_data, compressed_len,
+                             SHARED_SECRET_KEY, &arq_pkt.packet_iv,
+                             (uint8_t *)encrypted_data))
+            {
+                cerr << " [SENDER] Encryption failed at seq=" << (base_seq + b) << endl;
+                transfer_complete = true;
+                goto sender_abort;
+            }
+
+            bool is_last = (cur_offset + bytes_read >= (uint32_t)file_size);
+
+            arq_pkt.type = is_last ? 3 : 0;
+            arq_pkt.seq_num = base_seq + (uint32_t)b;
+            arq_pkt.chunk_offset = cur_offset;
+            arq_pkt.data_len = (uint16_t)compressed_len;
+            arq_pkt.flags = is_compressed ? 0x01 : 0x00;
+            memset(arq_pkt.hmac, 0, 16);
+            memcpy(arq_pkt.data, encrypted_data, compressed_len);
+
+            // 2e. CRC (on host-byte-order struct with crc32=0 and hmac=0)
+            arq_pkt.crc32 = 0;
+            arq_pkt.crc32 = calculate_crc32(
+                reinterpret_cast<const unsigned char *>(&arq_pkt),
+                sizeof(SlimDataPacket));
+
+            // 2f. Wire copy: serialize (byte-swap) then compute HMAC
+            SlimDataPacket &wire = wire_pkts[b];
+            wire = arq_pkt;               // copy host-order packet (with CRC)
+            serialize_slim_packet(&wire); // byte-swap in place for the wire
+            // hmac[] is 16 bytes — memset MUST be exactly 16 (not 32) to avoid
+            // overflowing into data[] and invalidating the CRC just computed.
+            memset(wire.hmac, 0, 16);
+            generate_hmac((const uint8_t *)&wire, sizeof(wire),
+                          SHARED_SECRET_KEY, wire.hmac);
+            memcpy(arq_pkt.hmac, wire.hmac, 16); // keep ARQ copy consistent
+
+            // 2g. Set up WSABUF — points directly into wire_pkts[] (zero copy)
+            wsabufs[b].buf = reinterpret_cast<CHAR *>(&wire);
+            wsabufs[b].len = sizeof(wire);
+
+            cur_offset += bytes_read;
+            batch_bytes_read += bytes_read;
+            pkts_built++;
+
+            if (is_last)
+                break;
+        }
+
+        if (pkts_built == 0)
+        {
+            Sleep(1);
             continue;
         }
 
-        uint32_t current_offset = chunk_offset;
-        // [CHANGED] SR tracks next_seq_num internally; read it directly
-        uint16_t seq = arq.get_next_seq_num();
+        // ── 3. WSASendTo burst — tight loop, minimal context switches ─────
+        int pkts_sent = 0;
+        for (int b = 0; b < pkts_built; b++)
+        {
+            DWORD bytes_sent_dword = 0;
+            int result = WSASendTo(
+                (SOCKET)sockfd, &wsabufs[b], 1, &bytes_sent_dword, 0,
+                reinterpret_cast<SOCKADDR *>(&server_addr), (int)addr_len,
+                NULL, NULL);
+
+            if (result == SOCKET_ERROR)
+            {
+                int err = WSAGetLastError();
+                if (err == WSAEWOULDBLOCK)
+                {
+                    // Socket buffer full — back off and retry remaining later
+                    Sleep(1);
+                    break;
+                }
+                cerr << " [SENDER] WSASendTo failed: " << err << endl;
+                transfer_complete = true;
+                goto sender_abort;
+            }
+            pkts_sent++;
+        }
+
+        if (pkts_sent == 0)
+        {
+            Sleep(1);
+            continue;
+        }
+
+        // ── 4. Batch-commit ARQ state (single lock for whole burst) ───────
+        pthread_mutex_lock(&arq_mutex);
+        for (int b = 0; b < pkts_sent; b++)
+        {
+            arq.record_sent_packet(arq_pkts[b]); // host-order copy, correct CRC
+            arq.increment_seq_num();             // advance next_seq_num by 1
+        }
+        chunk_offset += batch_bytes_read;
+        chunks_sent += pkts_sent;
+        total_bytes_sent += batch_bytes_read;
         pthread_mutex_unlock(&arq_mutex);
-
-        // Read file chunk outside the lock
-        char chunk_data[DATA_SIZE];
-        memset(chunk_data, 0, DATA_SIZE);
-        size_t bytes_read = 0;
-
-        if (!read_file_chunk(filename_str, current_offset, chunk_data, bytes_read))
-        {
-            cerr << " Error reading file at offset " << current_offset << endl;
-            transfer_complete = true;
-            break;
-        }
-
-        // Attempt compression
-        char compressed_data[DATA_SIZE + 1];
-        size_t compressed_len = sizeof(compressed_data);
-        bool is_compressed = false;
-
-        if (compress_data(chunk_data, bytes_read, compressed_data, compressed_len) == 0)
-        {
-            // New compress_data handles the raw fallback internally via marker byte.
-            // Check the marker to know which path was taken.
-            is_compressed = ((uint8_t)compressed_data[0] == 0x01);
-        }
-        else
-        {
-            // compress_data itself failed (Z_BUF_ERROR etc.) — send raw
-            memcpy(compressed_data + 1, chunk_data, bytes_read);
-            compressed_data[0] = 0x00; // raw marker
-            compressed_len = bytes_read + 1;
-            is_compressed = false;
-        }
-
-        // Build packet
-        struct Packet pkt;
-        memset(&pkt, 0, sizeof(pkt));
-
-        generate_iv(pkt.iv);
-
-        char encrypted_data[DATA_SIZE + 1];
-        if (!aes_encrypt((const uint8_t*)compressed_data, compressed_len, SHARED_SECRET_KEY, pkt.iv, (uint8_t*)encrypted_data)) {
-            cerr << " Encryption failed!" << endl;
-            transfer_complete = true;
-            break;
-        }
-
-        pkt.seq_num = seq;
-        pkt.ack_num = 0;
-        pkt.type = (current_offset + bytes_read >= (uint32_t)file_size)
-                       ? 3                        // END
-                       : (is_compressed ? 5 : 0); // DATA
-        strcpy(pkt.filename, filename.c_str());
-        pkt.file_size = file_size;
-        pkt.chunk_offset = current_offset;
-        pkt.crc32 = calculate_crc32((unsigned char *)encrypted_data, compressed_len);
-        pkt.data_len = (uint16_t)compressed_len;
-        memcpy(pkt.data, encrypted_data, compressed_len);
-        strcpy(pkt.username, "client_user");
-        pkt.window_size = SR_WINDOW_SIZE;
-        pkt.rtt_sample = 0;
-
-        // Serialize a copy for sending
-        struct Packet pkt_send = pkt;
-        serialize_packet(&pkt_send);
-
-        memset(pkt_send.hmac, 0, 32);
-        generate_hmac((const uint8_t*)&pkt_send, sizeof(pkt_send), SHARED_SECRET_KEY, pkt_send.hmac);
-        memcpy(pkt.hmac, pkt_send.hmac, 32);
-
-        int bytes_sent = sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
-                                (struct sockaddr *)&server_addr, addr_len);
-
-        if (bytes_sent > 0)
-        {
-            pthread_mutex_lock(&arq_mutex);
-            arq.record_sent_packet(pkt); // records pkt and sets send timestamp
-            arq.increment_seq_num();     // [CHANGED] advance manually (no increment_seq_num in SR)
-            chunk_offset += bytes_read;
-            chunks_sent++;
-            total_bytes_sent += bytes_read;
-            // if (seq % 1000 == 1) // Print every 1000 packets to avoid flooding the console
-            // {
-
-            //     cout << " [" << arq.get_in_flight_count() << "/" << SR_WINDOW_SIZE
-            //          << "] Seq=" << pkt.seq_num
-            //          << " offset=" << current_offset
-            //          << " bytes=" << bytes_read
-            //          << (is_compressed ? " [COMPRESSED]" : " [UNCOMPRESSED]") << endl;
-            // }
-            pthread_mutex_unlock(&arq_mutex);
-        }
-        else
-        {
-            cerr << " sendto failed" << endl;
-            transfer_complete = true;
-            break;
-        }
     }
+
+sender_abort:
+    infile.close();
     return nullptr;
 }
 
@@ -200,42 +336,96 @@ void *receiver_thread(void *arg)
 {
     while (!transfer_complete)
     {
-        struct Packet ack_pkt;
-        memset(&ack_pkt, 0, sizeof(ack_pkt));
+        struct ACKPacket ack_pkt;
+        // memset(&ack_pkt, 0, sizeof(ack_pkt));
 
         int bytes_recv = recvfrom(sockfd, (char *)&ack_pkt, sizeof(ack_pkt), 0,
                                   (struct sockaddr *)&server_addr, &addr_len);
 
         if (bytes_recv > 0)
         {
-            deserialize_packet(&ack_pkt);
-
-            if (ack_pkt.type == 1) // ACK
+            // [FIX Bug 3] Deserialize first so all fields are in host byte order,
+            // then use compute_ack_crc() which correctly excludes the crc32 tail field.
+            // The old code called ntohl(ack_pkt.crc32) BEFORE deserialize_ack_packet(),
+            // which also swaps crc32 — causing a double byte-swap.
+            deserialize_ack_packet(&ack_pkt);
+            uint32_t received_crc = ack_pkt.crc32;         // now host order after deserialize
+            uint32_t computed = compute_ack_crc(&ack_pkt); // hashes host-order fields, excludes crc32
+            if (computed == received_crc)
             {
+                if (ack_pkt.ack_num == 0)
+                    continue;
                 pthread_mutex_lock(&arq_mutex);
-                // [CHANGED] SR uses individual ACKs per seq_num (not cumulative)
-                arq.handle_ack(ack_pkt.ack_num);
+
+                uint32_t cum = ack_pkt.ack_num;    // cumulative watermark (server's next expected seq)
+                uint64_t sack_bm = ack_pkt.bitmap; // bit i = server has packet (cum + i)
+
+                // 1. Slide the window: bulk-free all RAM for packets below the watermark
+                arq.handle_cumulative_ack(cum);
+
+                // 2. Mark bitmap-confirmed out-of-order packets as individually acked
+                for (int i = 0; i < BITMAP_ACK; i++)
+                {
+                    if (sack_bm & (1u << i))
+                        arq.mark_packet_acked(cum + (uint32_t)i);
+                }
+                arq.advance_window();
                 acks_received++;
 
-                // cout << " ACK for seq=" << ack_pkt.ack_num
-                //     << " | in-flight=" <<   endl;
                 if (arq.get_in_flight_count() > 1000)
-                {
                     total_inflights++;
-                }
-                // Transfer done when all data sent and window fully drained
-                if (chunk_offset >= (uint32_t)file_size && arq.get_in_flight_count() == 0)
+
+                // 3. Fast retransmit: scan bitmap for holes below the highest received bit
+                //    e.g. bitmap = 0b1101 → cum+0, cum+2 received; cum+1 is a hole → retransmit now
+                int highest_bit = -1;
+                for (int i = ((sizeof(sack_bm) * 8) - 1); i >= 0; i--)
                 {
-                    transfer_complete = true;
+                    if (sack_bm & (1u << i))
+                    {
+                        highest_bit = i;
+                        break;
+                    }
                 }
+
+                uint32_t fast_retransmit_seqs[BITMAP_SIZE];
+                int fast_retransmit_count = 0;
+                for (int i = 0; i < highest_bit; i++)
+                {
+                    if (!(sack_bm & (1u << i)))
+                        fast_retransmit_seqs[fast_retransmit_count++] = cum + (uint32_t)i;
+                }
+
+                // 4. Check transfer completion
+                if (chunk_offset >= (uint32_t)file_size && arq.get_in_flight_count() == 0)
+                    transfer_complete = true;
+
                 pthread_mutex_unlock(&arq_mutex);
+
+                // 5. Fast retransmit outside the lock — prepare_retransmit re-acquires
+                //    window_mutex internally, no deadlock with arq_mutex.
+                for (int i = 0; i < fast_retransmit_count; i++)
+                {
+                    SlimDataPacket rpkt;
+                    if (arq.prepare_retransmit(fast_retransmit_seqs[i], rpkt))
+                    {
+                        SlimDataPacket pkt_send = rpkt;
+                        serialize_slim_packet(&pkt_send);
+                        sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
+                               (struct sockaddr *)&server_addr, addr_len);
+                        retransmissions++;
+                    }
+                }
             }
+            else
+            {
+                cerr << "[CLIENT] Corrupt ACK dropped! Seq=" << ack_pkt.ack_num << endl;
+                // Ignore WSAETIMEDOUT / WSAEWOULDBLOCK — just loop again
+            }
+            // Ignore WSAETIMEDOUT / WSAEWOULDBLOCK — just loop again
         }
-        // Ignore WSAETIMEDOUT / WSAEWOULDBLOCK — just loop again
     }
     return nullptr;
 }
-
 // ----------------------------------------------------------------------------
 // Thread 3: Timeout Thread
 // [CHANGED] SR checks timeouts per-packet and retransmits only the timed-out
@@ -247,45 +437,47 @@ void *timeout_thread(void *arg)
 {
     while (!transfer_complete)
     {
-        uint16_t timed_out_seq = 0;
+        // [CHANGED] Must be uint32_t to handle 1GB files (947,000+ packets)
+        uint32_t timed_out_seq = 0;
 
         pthread_mutex_lock(&arq_mutex);
-        // [CHANGED] SR returns the seq_num of the first timed-out packet (0 = none)
+        // SR returns the 32-bit seq_num of the first timed-out packet (0 = none)
         timed_out_seq = arq.check_for_timeout();
         pthread_mutex_unlock(&arq_mutex);
 
         if (timed_out_seq != 0)
         {
-            Packet retransmit_pkt;
+            // [CHANGED] Use SlimDataPacket to match the new network protocol
+            SlimDataPacket retransmit_pkt;
             bool ready = false;
 
             pthread_mutex_lock(&arq_mutex);
-            // [CHANGED] prepare_retransmit resets the timer, increments retry count,
-            //           and returns false if max retransmits exceeded
-            retransmissions++;
+            // prepare_retransmit fills our 'retransmit_pkt' from its internal buffer
             ready = arq.prepare_retransmit(timed_out_seq, retransmit_pkt);
+            if (ready)
+                retransmissions++;
             pthread_mutex_unlock(&arq_mutex);
 
             if (ready)
             {
-                // cout << "  Timeout! SR retransmitting only seq=" << timed_out_seq
-                //      << " (not full window)" << endl;
+                // Serialize specifically for the Slim structure
+                SlimDataPacket pkt_send = retransmit_pkt;
+                serialize_slim_packet(&pkt_send);
 
-                struct Packet pkt_send = retransmit_pkt;
-                serialize_packet(&pkt_send);
+                // bytes_sent will now be ~1.4KB instead of the old ~1.8KB
                 sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
                        (struct sockaddr *)&server_addr, addr_len);
             }
             else
             {
-                // Max retransmits exceeded — abort transfer
-                cerr << " Max retransmits exceeded for seq=" << timed_out_seq
-                     << ". Aborting." << endl;
+                cerr << " [TIMEOUT] Max retries exceeded for seq=" << timed_out_seq << ". Aborting." << endl;
                 transfer_complete = true;
             }
         }
 
-        Sleep(10); // Poll every 5ms
+        // Pro-Tip: 5ms is okay for local testing, but for 95 Mbps,
+        // a 1ms sleep makes the client respond to loss much faster.
+        Sleep(1);
     }
     return nullptr;
 }
@@ -367,8 +559,8 @@ int main(int argc, char *argv[])
     // 50ms receive timeout so receiver_thread doesn't block forever
     struct timeval tv;
     tv.tv_sec = 0;
-    tv.tv_usec = 300 * 1000;            // changed to 200ms to better accommodate SR's per-packet timeouts and avoid excessive looping on recvfrom
-    int buffer_size = 32 * 1024 * 1024; // 16 MB
+    tv.tv_usec = RECV_TIMEOUT * 1000;           // changed to 200ms to better accommodate SR's per-packet timeouts and avoid excessive looping on recvfrom
+    int buffer_size = SOC_BUFFER * 1024 * 1024; // 16 MB
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&buffer_size, sizeof(buffer_size));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buffer_size, sizeof(buffer_size));
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
@@ -386,7 +578,7 @@ int main(int argc, char *argv[])
     }
 
     cout << " SR Window=" << SR_WINDOW_SIZE << ", RTO=" << SR_PACKET_TIMEOUT_MS << "ms" << endl;
-    
+
     // Check for resume checkpoint
     uint32_t starting_seq = 1;
     uint32_t starting_offset = 0;
@@ -397,32 +589,84 @@ int main(int argc, char *argv[])
         buf << in.rdbuf();
         string content = buf.str();
         size_t f_pos = content.find("\"filename\"");
-        size_t s_pos = content.find("\"last_seq\"");
-        if (f_pos != string::npos && s_pos != string::npos) {
+        size_t s_pos = content.find("\"expected_seq\"");
+        if (f_pos != string::npos && s_pos != string::npos)
+        {
             size_t f_start = content.find("\"", f_pos + 10) + 1;
             size_t f_end = content.find("\"", f_start);
             string saved = content.substr(f_start, f_end - f_start);
-            if (saved == filename) {
+            if (saved == filename)
+            {
                 size_t s_start = content.find(":", s_pos) + 1;
-                while (isspace(content[s_start])) s_start++;
+                while (isspace(content[s_start]))
+                    s_start++;
                 size_t s_end = content.find_first_of(",}", s_start);
-                while (s_end > s_start && isspace(content[s_end - 1])) s_end--;
-                int last_seq = stoi(content.substr(s_start, s_end - s_start));
-                starting_seq = last_seq + 1;
-                starting_offset = last_seq * DATA_SIZE;
+                while (s_end > s_start && isspace(content[s_end - 1]))
+                    s_end--;
+                uint32_t expected_seq = (uint32_t)stoul(content.substr(s_start, s_end - s_start));
+                starting_seq = expected_seq;
+                starting_offset = (expected_seq - 1) * DATA_SIZE;
                 cout << " Resuming transfer from checkpoint: seq=" << starting_seq << ", offset=" << starting_offset << endl;
             }
         }
     }
-    
+
     chunk_offset = starting_offset;
-    arq.set_start_seq((uint16_t)starting_seq);
+    arq.set_start_seq(starting_seq);
 
     cout << "\n Starting Multithreaded Selective Repeat Transmission...\n"
          << endl;
 
     auto start_time = chrono::high_resolution_clock::now();
 
+    StartPacket start_pkt;
+    start_pkt.type = 2;
+    start_pkt.file_size = file_size;
+    start_pkt.total_chunks = total_chunks;
+    strncpy(start_pkt.filename, filename.c_str(), MAX_FILENAME);
+    serialize_start_packet(&start_pkt);
+    sendto(sockfd, (const char *)&start_pkt, sizeof(start_pkt), 0, (struct sockaddr *)&server_addr, addr_len);
+    cout << "[CLIENT] Waiting for server handshake..." << endl;
+    bool handshake_done = false;
+    auto handshake_start = chrono::steady_clock::now();
+
+    while (!handshake_done)
+    {
+        ACKPacket ack;
+        int r = recvfrom(sockfd, (char *)&ack, sizeof(ack), 0,
+                         (struct sockaddr *)&server_addr, &addr_len);
+        if (r > 0)
+        {
+            // [FIX Bug 3] Same pattern as receiver_thread — deserialize first.
+            deserialize_ack_packet(&ack);
+            uint32_t received_crc = ack.crc32; // host order after deserialize
+            uint32_t computed = compute_ack_crc(&ack);
+
+            if (computed == received_crc && ack.ack_num == 0 && ack.type == 1)
+            {
+                cout << "[CLIENT] Handshake confirmed! Server ready." << endl;
+                cout << "[CLIENT] Starting data transfer in 200ms..." << endl;
+                Sleep(200); // brief pause — matches server's Sleep(200)
+                handshake_done = true;
+            }
+        }
+
+        // Timeout — retransmit StartPacket
+        auto elapsed = chrono::steady_clock::now() - handshake_start;
+        if (chrono::duration_cast<chrono::milliseconds>(elapsed).count() > 1000)
+        {
+            cout << "[CLIENT] No handshake response — retrying StartPacket..." << endl;
+            StartPacket start_pkt;
+            start_pkt.type = 2;
+            start_pkt.file_size = file_size;
+            start_pkt.total_chunks = total_chunks;
+            strncpy(start_pkt.filename, filename.c_str(), 256);
+            serialize_start_packet(&start_pkt);
+            sendto(sockfd, (const char *)&start_pkt, sizeof(start_pkt), 0,
+                   (struct sockaddr *)&server_addr, addr_len);
+            handshake_start = chrono::steady_clock::now();
+        }
+    }
     pthread_t t_sender, t_receiver, t_timeout, t_logger;
     pthread_create(&t_sender, nullptr, sender_thread, nullptr);
     pthread_create(&t_receiver, nullptr, receiver_thread, nullptr);
@@ -432,7 +676,7 @@ int main(int argc, char *argv[])
     pthread_join(t_sender, nullptr);
     pthread_join(t_receiver, nullptr);
     pthread_join(t_timeout, nullptr);
-    pthread_join(t_logger, nullptr);
+    // pthread_join(t_logger, nullptr);
 
     closesocket(sockfd); // [FIXED] close() → closesocket() on Windows/Winsock
     WSACleanup();
@@ -450,5 +694,4 @@ int main(int argc, char *argv[])
     cout << "   - Throughput:               " << throughput << " Mbps" << endl;
     cout << "   - Max in-flight packets:    " << total_inflights << endl;
     cout << "   - Total retransmissions:    " << retransmissions << endl;
-    return 0;
 }

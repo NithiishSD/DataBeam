@@ -25,8 +25,9 @@ SelectiveRepeatARQ::~SelectiveRepeatARQ()
 // Check if we can send another packet (window not full)
 bool SelectiveRepeatARQ::can_send_packet() const
 {
-    int in_flight = next_seq_num - send_base;
-    return in_flight < SR_WINDOW_SIZE;
+    // [FIX Bug 5] Don't use (next_seq_num - send_base) — it underflows on uint32 wrap.
+    // window_buffer.size() is the authoritative in-flight count.
+    return (int)window_buffer.size() < SR_WINDOW_SIZE;
 }
 
 // Get number of packets currently in flight
@@ -39,7 +40,7 @@ int SelectiveRepeatARQ::get_in_flight_count() const
 }
 
 // Set starting sequence number (for resuming transfers)
-void SelectiveRepeatARQ::set_start_seq(uint16_t seq)
+void SelectiveRepeatARQ::set_start_seq(uint32_t seq)
 {
     pthread_mutex_lock(&window_mutex);
     send_base = seq;
@@ -50,7 +51,7 @@ void SelectiveRepeatARQ::set_start_seq(uint16_t seq)
 }
 
 // Record a packet as sent with timestamp
-void SelectiveRepeatARQ::record_sent_packet(const Packet &pkt)
+void SelectiveRepeatARQ::record_sent_packet(const SlimDataPacket &pkt)
 {
     pthread_mutex_lock(&window_mutex);
 
@@ -69,7 +70,7 @@ void SelectiveRepeatARQ::record_sent_packet(const Packet &pkt)
 }
 
 // Handle ACK for a specific packet (individual acknowledgment)
-void SelectiveRepeatARQ::handle_ack(uint16_t ack_num)
+void SelectiveRepeatARQ::handle_ack(uint32_t ack_num)
 {
     pthread_mutex_lock(&window_mutex);
 
@@ -91,8 +92,36 @@ void SelectiveRepeatARQ::handle_ack(uint16_t ack_num)
     advance_window();
 }
 
+// Hybrid SACK: slide the window to cum_ack in one bulk operation.
+// All buffered packets with seq < cum_ack are implicitly acknowledged and freed.
+// The ack_bitmap is reset because it is relative to send_base; the caller
+// re-populates it via mark_packet_acked() for any SACK bitmap-indicated packets.
+void SelectiveRepeatARQ::handle_cumulative_ack(uint32_t cum_ack)
+{
+    pthread_mutex_lock(&window_mutex);
+
+    if (cum_ack <= send_base)
+    {
+        // Already past this point — duplicate/stale ACK, nothing to do
+        pthread_mutex_unlock(&window_mutex);
+        return;
+    }
+
+    // Erase every buffered packet covered by the cumulative ACK
+    auto it = window_buffer.begin();
+    while (it != window_buffer.end() && it->first < cum_ack)
+        it = window_buffer.erase(it);
+
+    // Snap send_base forward and reset bitmap (now relative to new send_base)
+    send_base = cum_ack;
+    ack_bitmap.reset();
+
+    pthread_mutex_unlock(&window_mutex);
+}
+
+
 // Mark a specific packet as acknowledged
-void SelectiveRepeatARQ::mark_packet_acked(uint16_t seq_num)
+void SelectiveRepeatARQ::mark_packet_acked(uint32_t seq_num)
 {
     pthread_mutex_lock(&window_mutex);
 
@@ -138,7 +167,7 @@ void SelectiveRepeatARQ::advance_window()
 
 // Check for timeout on any packet in the window
 // Returns sequence number of first timed-out packet, or 0 if none
-uint16_t SelectiveRepeatARQ::check_for_timeout()
+uint32_t SelectiveRepeatARQ::check_for_timeout()
 {
     pthread_mutex_lock(&window_mutex);
 
@@ -147,7 +176,7 @@ uint16_t SelectiveRepeatARQ::check_for_timeout()
 
     for (auto &entry : window_buffer)
     {
-        uint16_t seq_num = entry.first;
+        uint32_t seq_num = entry.first; // [FIX Bug 4] was uint16_t
         WindowPacket &wp = entry.second;
 
         // Skip already-acked packets
@@ -171,7 +200,7 @@ uint16_t SelectiveRepeatARQ::check_for_timeout()
 }
 
 // Prepare packet for retransmission (reset timer, increment counter)
-bool SelectiveRepeatARQ::prepare_retransmit(uint16_t seq_num, Packet &pkt_out)
+bool SelectiveRepeatARQ::prepare_retransmit(uint32_t seq_num, SlimDataPacket &pkt_out)
 {
     pthread_mutex_lock(&window_mutex);
 
@@ -203,7 +232,7 @@ bool SelectiveRepeatARQ::prepare_retransmit(uint16_t seq_num, Packet &pkt_out)
 }
 
 // Retrieve packet data for retransmission
-bool SelectiveRepeatARQ::get_packet_for_retransmit(uint16_t seq_num, Packet &pkt_out)
+bool SelectiveRepeatARQ::get_packet_for_retransmit(uint32_t seq_num, SlimDataPacket &pkt_out)
 {
     pthread_mutex_lock(&window_mutex);
 
@@ -220,7 +249,7 @@ bool SelectiveRepeatARQ::get_packet_for_retransmit(uint16_t seq_num, Packet &pkt
 }
 
 // Check if a packet has been acknowledged
-bool SelectiveRepeatARQ::is_packet_acked(uint16_t seq_num) const
+bool SelectiveRepeatARQ::is_packet_acked(uint32_t seq_num) const
 {
     pthread_mutex_lock(&window_mutex);
 

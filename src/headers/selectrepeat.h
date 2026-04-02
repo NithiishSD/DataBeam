@@ -14,14 +14,15 @@
 #include <cstring>
 
 // Constants for Selective Repeat ARQ
-#define SR_WINDOW_SIZE 1024      // Sliding window size (N=8)
-#define SR_PACKET_TIMEOUT_MS 300 // Individual packet timeout: 500ms
-#define SR_MAX_RETRANSMITS 200   // Max retransmit attempts per packet
+#define SR_WINDOW_SIZE 4096     // Sliding window size
+#define SR_PACKET_TIMEOUT_MS 50 // Individual packet timeout (ms)
+#define SR_MAX_RETRANSMITS 200  // Max retransmit attempts per packet
+#define ACK_BATCH_SIZE 30       // Server sends SACK every N in-order packets
 
 // Structure to wrap Packet with timeout tracking for SR ARQ
 struct WindowPacket
 {
-    Packet pkt;           // The actual packet data
+    SlimDataPacket pkt;   // The actual packet data
     timespec send_time;   // Send timestamp (CLOCK_MONOTONIC)
     bool is_acked;        // Has this packet been acknowledged?
     int retransmit_count; // Number of retransmission attempts
@@ -29,7 +30,7 @@ struct WindowPacket
     // Constructor
     WindowPacket() : is_acked(false), retransmit_count(0)
     {
-        memset(&pkt, 0, sizeof(Packet));
+        memset(&pkt, 0, sizeof(SlimDataPacket));
         memset(&send_time, 0, sizeof(timespec));
     }
 };
@@ -39,12 +40,12 @@ class SelectiveRepeatARQ
 {
 private:
     // Window variables
-    uint16_t send_base;                     // Oldest unacked packet sequence
-    uint16_t next_seq_num;                  // Next packet to send
+    uint32_t send_base;                     // Oldest unacked packet sequence
+    uint32_t next_seq_num;                  // Next packet to send
     std::bitset<SR_WINDOW_SIZE> ack_bitmap; // ACK status: bit i = acked(base+i)?
 
-    // Packet buffer: map from seq_num to WindowPacket for thread-safe insertion/deletion
-    std::map<uint16_t, WindowPacket> window_buffer;
+    // Packet buffer: map from seq_num to WindowPacket — [FIX Bug 4] uint32_t key
+    std::map<uint32_t, WindowPacket> window_buffer;
 
     // Thread synchronization
     mutable pthread_mutex_t window_mutex; // Protects window_buffer and state variables
@@ -59,42 +60,48 @@ public:
 
     // === Window Management ===
     bool can_send_packet() const;
-    uint16_t get_send_base() const { return send_base; }
-    uint16_t get_next_seq_num() const { return next_seq_num; }
-    void set_start_seq(uint16_t seq);
+    uint32_t get_send_base() const { return send_base; }
+    uint32_t get_next_seq_num() const { return next_seq_num; }
+    void set_start_seq(uint32_t seq);
     void increment_seq_num() { next_seq_num++; }
     int get_in_flight_count() const;
 
     // === Packet Buffer Management ===
     // Record a packet as sent (store in window_buffer with current timestamp)
-    void record_sent_packet(const Packet &pkt);
-
+    void record_sent_packet(const SlimDataPacket &pkt);
+    void record_sent_packet(const StartPacket &pkt);
     // Retrieve a packet by sequence number (for retransmission)
-    bool get_packet_for_retransmit(uint16_t seq_num, Packet &pkt_out);
-
+    bool get_packet_for_retransmit(uint32_t seq_num, SlimDataPacket &pkt_out);
+    bool get_packet_for_retransmit(uint32_t seq_num, StartPacket &pkt_out);
     // === ACK Processing ===
     // Handle individual ACK for a specific packet (not cumulative)
-    void handle_ack(uint16_t ack_num);
+    void handle_ack(uint32_t ack_num);
+
+    // Hybrid SACK: slide the window to cum_ack in one shot.
+    // Erases all buffered packets with seq < cum_ack, advances send_base,
+    // and resets the ack_bitmap so the caller can re-populate it via
+    // mark_packet_acked() for any bitmap-indicated out-of-order packets.
+    void handle_cumulative_ack(uint32_t cum_ack);
 
     // Mark packet as acknowledged
-    void mark_packet_acked(uint16_t seq_num);
+    void mark_packet_acked(uint32_t seq_num);
 
     // Advance send_base when front of window is fully acked
     void advance_window();
 
     // === Timeout & Retransmission ===
-    // Check if any packet in the window has timed out (> 500ms)
+    // Check if any packet in the window has timed out
     // Returns the sequence number of the first timed-out packet, or 0 if none
-    uint16_t check_for_timeout();
+    uint32_t check_for_timeout();
 
     // Prepare packet for retransmission (updates send_time and retransmit_count)
-    bool prepare_retransmit(uint16_t seq_num, Packet &pkt_out);
-
+    bool prepare_retransmit(uint32_t seq_num, SlimDataPacket &pkt_out);
+    bool prepare_retransmit(uint32_t seq_num, StartPacket &pkt_out);
     // === Statistics & Debugging ===
-    uint16_t get_window_size() const { return SR_WINDOW_SIZE; }
+    uint32_t get_window_size() const { return SR_WINDOW_SIZE; }
     uint8_t get_acked_count() const { return ack_bitmap.count(); }
     bool is_window_empty() const { return window_buffer.empty(); }
-    bool is_packet_acked(uint16_t seq_num) const;
+    bool is_packet_acked(uint32_t seq_num) const;
 
     // Print current window state (for debugging)
     void print_window_state() const;
