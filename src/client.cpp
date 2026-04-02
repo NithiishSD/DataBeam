@@ -30,8 +30,6 @@
 #include <map>
 #include <sys/stat.h>
 
-
-
 #define BITMAP_ACK 64   // Bitmap ACKs cover 64 packets beyond the cumulative ACK
 #define SOC_BUFFER 128  // Socket buffer size in MB (both send and receive)
 #define RECV_TIMEOUT 30 // 30-second recv timeout for ACKs
@@ -40,27 +38,30 @@
 #define COMPRESSOR_THREADS 6 // increase to 8 on 8+ core machines
 using namespace std;
 
-
-struct ClientPerf {
+struct ClientPerf
+{
     // Stage Latencies (Microseconds)
     std::atomic<long long> total_disk_read_us{0};
     std::atomic<long long> total_compress_us{0};
-    std::atomic<long long> total_crypto_us{0};    // AES-GCM time
-    std::atomic<long long> total_send_syscall_us{0}; 
-    
+    std::atomic<long long> total_crypto_us{0}; // AES-GCM time
+    std::atomic<long long> total_send_syscall_us{0};
+
     // Waiting/Blocking Metrics
     std::atomic<long long> total_window_wait_us{0}; // Time spent waiting for ACKs/Window Slide
-    
+
     // Counters
     std::atomic<uint32_t> packets_sent{0};
     std::atomic<uint32_t> window_full_events{0};
 
-    static long long now_us() {
+    static long long now_us()
+    {
         return std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+                   std::chrono::high_resolution_clock::now().time_since_epoch())
+            .count();
     }
 
-    void reset() {
+    void reset()
+    {
         total_disk_read_us = total_compress_us = total_crypto_us = 0;
         total_send_syscall_us = total_window_wait_us = 0;
         packets_sent = window_full_events = 0;
@@ -135,6 +136,61 @@ struct ReadyPacket
     size_t original_len; // uncompressed chunk size (for counter updates)
 };
 
+// ============================================================================
+// ReorderBuf -- zero-allocation O(1) reorder buffer
+//
+// Replaces std::map<uint32_t,ReadyPacket> in the sender thread.
+// Indexed by (seq_num & MASK): no heap allocations, no tree traversal.
+// Capacity must be >= SR_WINDOW_SIZE (4096) and a power of 2.
+// Safety: only the sender thread reads/writes slots, so no lock needed.
+// ============================================================================
+struct ReorderSlot
+{
+    ReadyPacket pkt;
+    bool        valid = false;
+};
+
+static_assert((SR_WINDOW_SIZE & (SR_WINDOW_SIZE - 1)) == 0,
+              "SR_WINDOW_SIZE must be power of 2");
+static const uint32_t REORDER_CAP  = SR_WINDOW_SIZE; // 4096
+static const uint32_t REORDER_MASK = REORDER_CAP - 1;
+
+struct ReorderBuf
+{
+    ReorderSlot slots[REORDER_CAP];
+    uint32_t    pending_count = 0; // how many valid slots are occupied
+
+    // Store a packet -- O(1)
+    void insert(uint32_t seq, const ReadyPacket &rp)
+    {
+        uint32_t idx = seq & REORDER_MASK;
+        slots[idx].pkt   = rp;
+        slots[idx].valid = true;
+        pending_count++;
+    }
+
+    // Check if next expected seq is ready -- O(1)
+    bool has(uint32_t seq) const
+    {
+        return slots[seq & REORDER_MASK].valid;
+    }
+
+    // Consume and return the slot -- O(1)
+    ReadyPacket &get(uint32_t seq)
+    {
+        return slots[seq & REORDER_MASK].pkt;
+    }
+
+    // Mark slot as consumed -- O(1)
+    void erase(uint32_t seq)
+    {
+        slots[seq & REORDER_MASK].valid = false;
+        pending_count--;
+    }
+
+    bool empty() const { return pending_count == 0; }
+};
+
 // ---- Pipeline queues -------------------------------------------------------
 // Raw queue: dispatcher -> compressor threads (SPMC: one dispatcher, N compressors)
 // Ready queue: compressor threads -> sender thread (MPSC: N compressors, one sender)
@@ -155,28 +211,6 @@ atomic<uint32_t> dispatch_seq{1};
 atomic<bool> dispatch_done{false};
 atomic<int> compressors_done{0};
 
-struct PerfStats
-{
-    // Latency Metrics
-    atomic<long long> total_net_recv_time_us{0};
-    atomic<long long> total_worker_wait_us{0};
-    atomic<long long> total_decomp_time_us{0};
-    atomic<long long> total_disk_write_us{0};
-
-    // Throughput & Buffer Metrics
-    atomic<uint32_t> packets_processed{0};
-    atomic<uint32_t> buffer_full_events{0};
-    atomic<uint32_t> crc_fails{0};
-
-    static long long now_us()
-    {
-        return std::chrono::duration_cast<std::chrono::microseconds>(
-                   std::chrono::high_resolution_clock::now().time_since_epoch())
-            .count();
-    }
-};
-
-PerfStats g_perf;
 uint32_t get_file_size(const char *filename)
 {
     struct _stat64 st;
@@ -366,43 +400,60 @@ void *compressor_thread(void *arg)
 
 // ============================================================================
 // STAGE 3: Sender Thread (1 thread)
-// Pops ReadyPackets, reorders by seq_num, serializes, computes HMAC,
-// sends via WSASendTo, records in ARQ.  Reorder buffer ensures packets
-// are sent in strict seq_num order even if compressors finish out of order.
+//
+// Reorder buffer: ReorderBuf (circular array, O(1), zero heap alloc)
+//   replaces the old std::map which did a heap alloc+free per packet.
+//   For a 1GB file (~715K packets) that eliminates ~1.4M heap operations.
+//
+// Window-space check: uses arq.get_in_flight_count() under arq_mutex.
+//   The check only runs when the window is FULL -- in the happy path
+//   (window has space) it hits the fast-path break immediately.
 // ============================================================================
 
 void *sender_thread(void *arg)
 {
-    std::map<uint32_t, ReadyPacket> pending;
-    // Recover starting seq from ARQ send_base (set in main before threads)
+    // Stack-allocated reorder buffer -- no heap, ~9 MB on stack (within 64MB limit)
+    // If stack is tight, move to static or thread-local storage.
+    ReorderBuf pending;
+
+    // Recover starting seq from ARQ send_base (honours resume checkpoint)
     uint32_t next_send_seq = arq.get_send_base();
 
     while (!transfer_complete)
     {
-        // 1. Drain ready_queue into reorder buffer
+        // ---- 1. Drain ready_queue into circular reorder buffer (O(1) each) --
         ReadyPacket rp;
         while (ready_queue.pop(rp))
-            pending[rp.pkt.seq_num] = rp;
+            pending.insert(rp.pkt.seq_num, rp);
 
-        // 2. Send packets in strict seq_num order
-        while (pending.count(next_send_seq))
+        // ---- 2. Send packets in strict seq_num order ----------------------
+        while (pending.has(next_send_seq))
         {
-            // Wait for ARQ window space
-            while (!transfer_complete)
+            // Window-space check: only lock when the window might be full
+            pthread_mutex_lock(&arq_mutex);
+            int in_flight = arq.get_in_flight_count();
+            pthread_mutex_unlock(&arq_mutex);
+
+            if (in_flight >= SR_WINDOW_SIZE)
             {
-                pthread_mutex_lock(&arq_mutex);
-                int in_flight = arq.get_in_flight_count();
-                pthread_mutex_unlock(&arq_mutex);
-                if (in_flight < SR_WINDOW_SIZE)
-                    break;
-                SwitchToThread();
+                // Window full -- spin until an ACK slides it
+                g_cperf.window_full_events.fetch_add(1, std::memory_order_relaxed);
+                while (!transfer_complete)
+                {
+                    SwitchToThread();
+                    pthread_mutex_lock(&arq_mutex);
+                    in_flight = arq.get_in_flight_count();
+                    pthread_mutex_unlock(&arq_mutex);
+                    if (in_flight < SR_WINDOW_SIZE)
+                        break;
+                }
             }
             if (transfer_complete)
                 return nullptr;
 
-            ReadyPacket &cur = pending[next_send_seq];
+            ReadyPacket &cur = pending.get(next_send_seq);
 
-            // Wire copy: serialize then HMAC
+            // Wire copy: byte-swap then HMAC (cur.pkt stays host-order for ARQ)
             SlimDataPacket wire = cur.pkt;
             serialize_slim_packet(&wire);
             memset(wire.hmac, 0, 16);
@@ -416,10 +467,13 @@ void *sender_thread(void *arg)
             wsabuf.len = sizeof(wire);
             DWORD bytes_sent_dword = 0;
 
+            long long t0 = g_cperf.now_us();
             int result = WSASendTo(
                 (SOCKET)sockfd, &wsabuf, 1, &bytes_sent_dword, 0,
                 reinterpret_cast<SOCKADDR *>(&server_addr), (int)addr_len,
                 NULL, NULL);
+            g_cperf.total_send_syscall_us.fetch_add(
+                g_cperf.now_us() - t0, std::memory_order_relaxed);
 
             if (result == SOCKET_ERROR)
             {
@@ -434,7 +488,7 @@ void *sender_thread(void *arg)
                 return nullptr;
             }
 
-            // Record in ARQ + update counters
+            // Record in ARQ + update all global counters under one lock
             pthread_mutex_lock(&arq_mutex);
             arq.record_sent_packet(cur.pkt);
             arq.increment_seq_num();
@@ -443,12 +497,15 @@ void *sender_thread(void *arg)
             chunk_offset += (uint32_t)cur.original_len;
             pthread_mutex_unlock(&arq_mutex);
 
-            pending.erase(next_send_seq);
+            g_cperf.packets_sent.fetch_add(1, std::memory_order_relaxed);
+
+            pending.erase(next_send_seq); // O(1) -- just clears valid flag
             next_send_seq++;
         }
 
-        // 3. Check termination
-        if (compressors_done.load(std::memory_order_acquire) == COMPRESSOR_THREADS && ready_queue.empty() && pending.empty())
+        // ---- 3. Termination check ----------------------------------------
+        if (compressors_done.load(std::memory_order_acquire) == COMPRESSOR_THREADS
+            && ready_queue.empty() && pending.empty())
         {
             pthread_mutex_lock(&arq_mutex);
             int in_flight = arq.get_in_flight_count();
@@ -601,7 +658,7 @@ void *timeout_thread(void *arg)
 
         // Pro-Tip: 5ms is okay for local testing, but for 95 Mbps,
         // a 1ms sleep makes the client respond to loss much faster.
-        Sleep(5);
+        Sleep(1);
     }
     return nullptr;
 }
