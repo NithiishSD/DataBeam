@@ -11,7 +11,8 @@ using namespace std;
 
 // Constructor: Initialize SR ARQ state
 SelectiveRepeatARQ::SelectiveRepeatARQ()
-    : send_base(1), next_seq_num(1), rto_ms(SR_PACKET_TIMEOUT_MS), in_flight_count(0)
+    : send_base(1), next_seq_num(1), rto_ms(SR_PACKET_TIMEOUT_MS),
+      max_retransmits(SR_MAX_RETRANSMITS), in_flight_count(0)
 {
     pthread_mutex_init(&window_mutex, NULL);
     for (int i = 0; i < SR_WINDOW_SIZE; i++) {
@@ -212,8 +213,8 @@ uint32_t SelectiveRepeatARQ::check_for_timeout()
         long elapsed_ms = (now.tv_sec - wp.send_time.tv_sec) * 1000 +
                           (now.tv_nsec - wp.send_time.tv_nsec) / 1000000;
 
-        // Check if timeout exceeded
-        if (elapsed_ms >= SR_PACKET_TIMEOUT_MS)
+        // Check if timeout exceeded — use the DYNAMIC rto_ms member, not the compile-time macro
+        if (elapsed_ms >= (long)rto_ms)
         {
             pthread_mutex_unlock(&window_mutex);
             return seq_num; // Found a timed-out packet
@@ -238,10 +239,10 @@ bool SelectiveRepeatARQ::prepare_retransmit(uint32_t seq_num, SlimDataPacket &pk
 
     WindowPacket &wp = window_buffer[idx];
 
-    // Check maximum retransmit limit
-    if (wp.retransmit_count >= SR_MAX_RETRANSMITS)
+    // Check maximum retransmit limit (dynamically set by AdaptiveParams)
+    if (wp.retransmit_count >= max_retransmits)
     {
-        cout << "  Max retransmits reached for seq=" << seq_num << endl;
+        cout << "  Max retransmits (" << max_retransmits << ") reached for seq=" << seq_num << endl;
         pthread_mutex_unlock(&window_mutex);
         return false;
     }
@@ -257,7 +258,49 @@ bool SelectiveRepeatARQ::prepare_retransmit(uint32_t seq_num, SlimDataPacket &pk
     return true;
 }
 
-// Retrieve packet data for retransmission
+// Fast retransmit: cooldown guard so SACK floods don't burn the retransmit budget.
+// Does NOT increment retransmit_count. Returns false if packet retransmitted too recently
+// (within rto_ms/4), preventing thousands of SACKs from exhausting the retry budget.
+bool SelectiveRepeatARQ::try_fast_retransmit(uint32_t seq_num, SlimDataPacket &pkt_out)
+{
+    pthread_mutex_lock(&window_mutex);
+
+    uint32_t idx = seq_num & (SR_WINDOW_SIZE - 1);
+    if (!slot_occupied[idx] || window_buffer[idx].pkt.seq_num != seq_num)
+    {
+        pthread_mutex_unlock(&window_mutex);
+        return false;
+    }
+
+    WindowPacket &wp = window_buffer[idx];
+    if (wp.is_acked)
+    {
+        pthread_mutex_unlock(&window_mutex);
+        return false;
+    }
+
+    // Cooldown check: skip if retransmitted within rto_ms/4 ago
+    timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long since_ms = (now.tv_sec  - wp.last_retransmit_time.tv_sec)  * 1000 +
+                    (now.tv_nsec - wp.last_retransmit_time.tv_nsec) / 1000000;
+    long cooldown_ms = (long)(rto_ms) / 4;
+    if (cooldown_ms < 10) cooldown_ms = 10; // floor at 10ms
+    if (since_ms < cooldown_ms)
+    {
+        pthread_mutex_unlock(&window_mutex);
+        return false; // too soon — skip this fast retransmit
+    }
+
+    // OK to retransmit: update cooldown timestamp but NOT retransmit_count
+    wp.last_retransmit_time = now;
+    pkt_out = wp.pkt;
+
+    pthread_mutex_unlock(&window_mutex);
+    return true;
+}
+
+
 bool SelectiveRepeatARQ::get_packet_for_retransmit(uint32_t seq_num, SlimDataPacket &pkt_out)
 {
     pthread_mutex_lock(&window_mutex);

@@ -26,10 +26,10 @@ static inline uint64_t ntohll_portable(uint64_t v)
 #define ntohll ntohll_portable
 struct ACKPacket
 {
-    uint32_t ack_num; // The sequence number being acknowledged
-    uint64_t bitmap[4];  // For Selective Repeat (which neighbors are also here) // increase teh bitmap size based on window size
-    uint8_t type;     // Always set to 1 (ACK)
-    uint32_t crc32;   // Integrity check for the ACK itself
+    uint32_t ack_num;    // Cumulative ACK watermark (next seq server needs)
+    uint64_t bitmap[64]; // SACK bitmap: 64 chunks × 64 bits = 4096 bits = SR_WINDOW_SIZE
+    uint8_t type;        // Always set to 1 (ACK)
+    uint32_t crc32;      // Integrity check for the ACK itself
 };
 #pragma pack(pop)
 
@@ -110,7 +110,7 @@ inline void deserialize_start_packet(struct StartPacket *pkt)
 inline void serialize_ack_packet(struct ACKPacket *pkt)
 {
     pkt->ack_num = htonl(pkt->ack_num);
-    for(int i = 0; i < 4; i++) {
+    for (int i = 0; i < 64; i++) {
         pkt->bitmap[i] = htonll(pkt->bitmap[i]);
     }
     pkt->crc32 = htonl(pkt->crc32);
@@ -119,7 +119,7 @@ inline void serialize_ack_packet(struct ACKPacket *pkt)
 inline void deserialize_ack_packet(struct ACKPacket *pkt)
 {
     pkt->ack_num = ntohl(pkt->ack_num);
-    for(int i = 0; i < 4; i++) {
+    for (int i = 0; i < 64; i++) {
         pkt->bitmap[i] = ntohll(pkt->bitmap[i]);
     }
     pkt->crc32 = ntohl(pkt->crc32);

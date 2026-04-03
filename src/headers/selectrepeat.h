@@ -17,21 +17,23 @@
 #define SR_WINDOW_SIZE 4096     // Sliding window size
 #define SR_PACKET_TIMEOUT_MS 100 // Individual packet timeout (ms)
 #define SR_MAX_RETRANSMITS 200  // Max retransmit attempts per packet
-#define ACK_BATCH_SIZE 256      // Server sends SACK every N in-order packets
+#define ACK_BATCH_SIZE 64      // Server sends SACK every N in-order packets
 
 // Structure to wrap Packet with timeout tracking for SR ARQ
 struct WindowPacket
 {
-    SlimDataPacket pkt;   // The actual packet data
-    timespec send_time;   // Send timestamp (CLOCK_MONOTONIC)
-    bool is_acked;        // Has this packet been acknowledged?
-    int retransmit_count; // Number of retransmission attempts
+    SlimDataPacket pkt;           // The actual packet data
+    timespec send_time;           // Send timestamp (CLOCK_MONOTONIC)
+    timespec last_retransmit_time; // Timestamp of last retransmit (for fast-retransmit cooldown)
+    bool is_acked;                // Has this packet been acknowledged?
+    int retransmit_count;         // Timeout-retransmit attempts (budget-limited)
 
     // Constructor
     WindowPacket() : is_acked(false), retransmit_count(0)
     {
         memset(&pkt, 0, sizeof(SlimDataPacket));
         memset(&send_time, 0, sizeof(timespec));
+        memset(&last_retransmit_time, 0, sizeof(timespec));
     }
 };
 
@@ -53,8 +55,9 @@ private:
     // Thread synchronization
     mutable pthread_mutex_t window_mutex; // Protects window state
 
-    // RTT & Timeout (optional congestion control integration)
-    uint32_t rto_ms; // Retransmission timeout in milliseconds
+    // RTT & Timeout (dynamically adjusted by timeout_thread)
+    uint32_t rto_ms;         // Retransmission timeout in milliseconds
+    int      max_retransmits; // Dynamic max retransmit attempts (set by AdaptiveParams)
 
 public:
     // Constructor & Destructor
@@ -68,6 +71,10 @@ public:
     void set_start_seq(uint32_t seq);
     void increment_seq_num() { next_seq_num++; }
     int get_in_flight_count() const;
+
+    // Dynamic tuning setters — called by timeout_thread via AdaptiveParams
+    void set_rto(int new_rto_ms)              { rto_ms = (uint32_t)new_rto_ms; }
+    void set_max_retransmits(int new_max)     { max_retransmits = new_max; }
 
     // === Packet Buffer Management ===
     // Record a packet as sent (store in window_buffer with current timestamp)
@@ -98,8 +105,15 @@ public:
     uint32_t check_for_timeout();
 
     // Prepare packet for retransmission (updates send_time and retransmit_count)
+    // Used by timeout_thread — increments retransmit_count, returns false when budget exhausted.
     bool prepare_retransmit(uint32_t seq_num, SlimDataPacket &pkt_out);
     bool prepare_retransmit(uint32_t seq_num, StartPacket &pkt_out);
+
+    // Fast retransmit (from receiver_thread): has cooldown guard, does NOT increment
+    // retransmit_count. Returns false if the packet was retransmitted too recently
+    // (within rto_ms/4), preventing the retransmit budget from being burned by a
+    // flood of duplicate SACKs.
+    bool try_fast_retransmit(uint32_t seq_num, SlimDataPacket &pkt_out);
     // === Statistics & Debugging ===
     uint32_t get_window_size() const { return SR_WINDOW_SIZE; }
     uint8_t get_acked_count() const { return ack_bitmap.count(); }

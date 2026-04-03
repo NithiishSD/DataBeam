@@ -31,8 +31,8 @@
 #include <map>
 #include <sys/stat.h>
 
-#define BITMAP_ACK 512   // Bitmap ACKs cover 1024 packets beyond the cumulative ACK
-#define SOC_BUFFER 16  // Socket buffer size in MB (both send and receive)
+#define BITMAP_ACK 4096  // Bitmap covers the full SR_WINDOW_SIZE (64 chunks × 64 bits)
+#define SOC_BUFFER 32  // Socket buffer size in MB (both send and receive)
 #define RECV_TIMEOUT 100 // 30-second recv timeout for ACKs
 #define BITMAP_SIZE 512  // Bitmap size ACKs cover 1024 packets beyond the cumulative ACK set 20% of window size
 // Number of compressor threads -- tune to CPU core count
@@ -121,10 +121,55 @@ int total_chunks;
 int chunks_sent = 0;
 int acks_received = 0;
 uint64_t total_bytes_sent = 0;
-int total_inflights = 0;
+int peak_inflight = 0;       // actual peak in-flight count (was misnamed total_inflights)
 int retransmissions = 0;
 volatile bool transfer_complete = false;
 bool disable_compression = false;
+
+// ----------------------------------------------------------------------------
+// AdaptiveParams — dynamic tuning based on observed loss and throughput
+//
+// RTO: starts at SR_PACKET_TIMEOUT_MS, doubles on each consecutive timeout
+//      (exponential backoff per RFC 6298), resets to base on successful ACK.
+// max_retransmits: scales with RTO so we don't abort too early under high loss.
+// ----------------------------------------------------------------------------
+struct AdaptiveParams
+{
+    // RTO state
+    std::atomic<int> rto_ms{SR_PACKET_TIMEOUT_MS};
+    std::atomic<int> consecutive_timeouts{0};
+    static constexpr int MIN_RTO_MS   = 50;    // floor
+    static constexpr int MAX_RTO_MS   = 2000;  // ceiling (2s)
+
+    // Max retransmits: proportional to how long we're willing to wait
+    // Formula: at MIN_RTO each retry costs 50ms → 200*50ms=10s window
+    //          at MAX_RTO each retry costs 2000ms → 15 retries = 30s window
+    int get_max_retransmits() const
+    {
+        // Allow up to 10 seconds of total retry time per packet
+        int budget_ms = 10000;
+        return std::max(10, budget_ms / rto_ms.load());
+    }
+
+    // Called when a packet times out — doubles RTO up to MAX
+    void on_timeout()
+    {
+        int t = consecutive_timeouts.fetch_add(1) + 1;
+        int new_rto = SR_PACKET_TIMEOUT_MS * (1 << std::min(t, 5)); // cap doubling at 32x
+        rto_ms.store(std::min(new_rto, MAX_RTO_MS));
+    }
+
+    // Called when an ACK arrives — resets backoff
+    void on_ack()
+    {
+        if (consecutive_timeouts.load() > 0)
+        {
+            consecutive_timeouts.store(0);
+            rto_ms.store(SR_PACKET_TIMEOUT_MS);
+        }
+    }
+};
+AdaptiveParams g_adapt;
 
 // ----------------------------------------------------------------------------
 // Helper Functions
@@ -585,32 +630,43 @@ void *receiver_thread(void *arg)
 
                 // 1. Slide the window
                 arq.handle_cumulative_ack(cum);
-                uint32_t fast_retransmit_seqs[BITMAP_ACK];
+                // Heap-allocate to avoid stack overflow risk (BITMAP_ACK=512 * 4B = 2KB on receiver stack)
+                static uint32_t fast_retransmit_seqs[BITMAP_ACK]; // static: single receiver thread, no race
                 int fast_retransmit_count = 0;
-                
-                // 2. Mark specific received packets
-                for (int chunk_idx = 0; chunk_idx < 4; chunk_idx++) {
+
+                // 2. Mark specific received packets (scan all 64 bitmap chunks)
+                for (int chunk_idx = 0; chunk_idx < 64; chunk_idx++) {
                     uint64_t chunk = ack_pkt.bitmap[chunk_idx];
                     if (chunk == 0xFFFFFFFFFFFFFFFFULL) {
-                        for(int b=0; b<64; b++) 
+                        for(int b=0; b<64; b++)
                             arq.mark_packet_acked(cum + (chunk_idx * 64) + b);
                     }
                     else if (chunk != 0) {
                         for (int bit = 0; bit < 64; bit++) {
-                            if (chunk & (1ULL << bit)) 
+                            if (chunk & (1ULL << bit))
                                 arq.mark_packet_acked(cum + (chunk_idx * 64) + bit);
                         }
                     }
                 }
-                
+
                 acks_received++;
 
-                if (arq.get_in_flight_count() > 1000)
-                    total_inflights++;
+                // Only reset backoff when the cumulative window actually ADVANCES.
+                // Calling on_ack() for every SACK where cum=1 (stuck) defeats the backoff.
+                static uint32_t last_cum_ack_seen = 0;
+                if (cum > last_cum_ack_seen) {
+                    g_adapt.on_ack();
+                    last_cum_ack_seen = cum;
+                }
 
-                // 3. Find highest SACK bit across all chunks
+                // Track actual peak in-flight count
+                int cur_inflight = arq.get_in_flight_count();
+                if (cur_inflight > peak_inflight)
+                    peak_inflight = cur_inflight;
+
+                // 3. Find highest SACK bit across all 64 chunks
                 int max_sack_idx = -1;
-                for (int chunk_idx = 3; chunk_idx >= 0; chunk_idx--) {
+                for (int chunk_idx = 63; chunk_idx >= 0; chunk_idx--) {
                     if (ack_pkt.bitmap[chunk_idx] != 0) {
                         unsigned long highest_bit = 0;
                         _BitScanReverse64(&highest_bit, ack_pkt.bitmap[chunk_idx]);
@@ -619,9 +675,9 @@ void *receiver_thread(void *arg)
                     }
                 }
 
-                // 4. Identify holes and schedule fast retransmit
+                // 4. Identify holes and schedule fast retransmit (scan all 64 chunks)
                 if (max_sack_idx >= 0) {
-                    for (int chunk_idx = 0; chunk_idx < 4; chunk_idx++) {
+                    for (int chunk_idx = 0; chunk_idx < 64; chunk_idx++) {
                         uint64_t chunk = ack_pkt.bitmap[chunk_idx];
                         uint64_t holes = ~chunk; // Flip bits: 0s (holes) become 1s
                         
@@ -654,10 +710,12 @@ void *receiver_thread(void *arg)
 
                 long long t_scan_done = ClientPerf::now_us();
 
-                // 5. Retransmit OUTSIDE the lock to keep the Sender thread moving
+                // 5. Fast retransmit OUTSIDE the lock using try_fast_retransmit.
+                // This has a built-in cooldown (rto_ms/4) so a flood of SACKs with the
+                // same hole does NOT burn through retransmit_count for that packet.
                 for (int i = 0; i < fast_retransmit_count; i++) {
                     SlimDataPacket rpkt;
-                    if (arq.prepare_retransmit(fast_retransmit_seqs[i], rpkt)) {
+                    if (arq.try_fast_retransmit(fast_retransmit_seqs[i], rpkt)) {
                         serialize_slim_packet(&rpkt);
                         sendto(sockfd, (const char *)&rpkt, sizeof(rpkt), 0,
                                (struct sockaddr *)&server_addr, addr_len);
@@ -681,7 +739,10 @@ void *receiver_thread(void *arg)
 }
 
 // ----------------------------------------------------------------------------
-// Timeout Thread (UNCHANGED)
+// Timeout Thread — Adaptive RTO with exponential backoff
+// RTO doubles on each consecutive timeout (RFC 6298), resets on ACK receipt.
+// max_retransmits is dynamically derived from the current RTO so we never
+// abort prematurely under high latency, nor spin forever under total loss.
 // ----------------------------------------------------------------------------
 void *timeout_thread(void *arg)
 {
@@ -695,24 +756,27 @@ void *timeout_thread(void *arg)
 
         if (timed_out_seq != 0)
         {
-            // [CHANGED] Use SlimDataPacket to match the new network protocol
             SlimDataPacket retransmit_pkt;
             bool ready = false;
 
             pthread_mutex_lock(&arq_mutex);
-            // prepare_retransmit fills our 'retransmit_pkt' from its internal buffer
+            // Use dynamic max_retransmits instead of the old hardcoded 200
+            int dyn_max = g_adapt.get_max_retransmits();
+            arq.set_max_retransmits(dyn_max);
             ready = arq.prepare_retransmit(timed_out_seq, retransmit_pkt);
             if (ready)
+            {
                 retransmissions++;
+                g_adapt.on_timeout(); // double the RTO
+                // Update ARQ's internal RTO so check_for_timeout uses new value
+                arq.set_rto(g_adapt.rto_ms.load());
+            }
             pthread_mutex_unlock(&arq_mutex);
 
             if (ready)
             {
-                // Serialize specifically for the Slim structure
                 SlimDataPacket pkt_send = retransmit_pkt;
                 serialize_slim_packet(&pkt_send);
-
-                // bytes_sent will now be ~1.4KB instead of the old ~1.8KB
                 sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
                        (struct sockaddr *)&server_addr, addr_len);
             }
@@ -969,7 +1033,7 @@ int main(int argc, char *argv[])
     cout << "   - ACKs received:            " << acks_received << endl;
     cout << "   - Elapsed time:             " << fixed << setprecision(2) << elapsed << "s" << endl;
     cout << "   - Throughput:               " << throughput << " Mbps" << endl;
-    cout << "   - Max in-flight packets:    " << total_inflights << endl;
+    cout << "   - Peak in-flight packets:   " << peak_inflight << " / " << SR_WINDOW_SIZE << endl;
     cout << "   - Total retransmissions:    " << retransmissions << endl;
     print_client_report();
 }
