@@ -22,6 +22,7 @@
 #include "./headers/concurrentqueue.h"
 #include "./headers/crchw.h"
 #include "./headers/crypto.h"
+#include "./headers/constants.h"
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -29,21 +30,15 @@
 using namespace std;
 
 // =============================================================================
-// Tuning Constants
+// Tuning Constants (Now moved to constants.h)
 // =============================================================================
-#define BUFFER_SIZE 4096 // Must match SR_WINDOW_SIZE (client's sliding window)
-// #define ACK_BATCH_SIZE 32 // Send SACK every N in-order packets
-#define RECV_TIMEOUT 100 // 100ms — responsive to client (was 1000ms)
-#define SOC_BUFFER 16    // 64MB socket buffers (was 32MB)
-#define DECOMPRESSOR_THREADS 4
-#define IDLE_TIMEOUT_COUNT 100 // 100 × 100ms = 10s of true inactivity (was 10s)
+// Tuning Constants are now in constants.h
 
 // =============================================================================
 // Work Queue Item — CRC/HMAC-verified raw packet waiting for decompression
 // =============================================================================
 struct WorkItem {
   SlimDataPacket pkt;
-  size_t compressed_len;
 };
 
 // =============================================================================
@@ -54,7 +49,7 @@ struct WorkItem {
 // Indexed by seq_num % BUFFER_SIZE — no collision because window == buffer.
 // =============================================================================
 struct PoolSlot {
-  char data[DATA_SIZE + 1];
+  char data[DataBeam::PACKET_DATA_SIZE + 1];
   size_t data_len;
   uint8_t type;
   uint32_t chunk_offset;
@@ -160,7 +155,7 @@ uint32_t load_checkpoint(const string &target_filename) {
 
 void *logger_thread(void *arg) {
   while (!server_done.load(std::memory_order_relaxed)) {
-    Sleep(1000);
+    Sleep(DataBeam::MS_PER_SEC);
     if (server_done.load(std::memory_order_relaxed))
       break;
     cout << "[LOGGER] ack_seq=" << g_ack_seq.load() << endl;
@@ -185,10 +180,9 @@ void *decompressor_thread(void *arg) {
 
     if (!got) {
       if (net_recv_done.load(std::memory_order_acquire)) {
-        // Final drain attempt after network thread finished
         got = work_queue.try_dequeue(ctok, item);
         if (!got)
-          break; // truly done
+          break;
       }
       SwitchToThread();
       continue;
@@ -196,47 +190,69 @@ void *decompressor_thread(void *arg) {
 
     SlimDataPacket &pkt = item.pkt;
 
-    // ---- 1. DECRYPT --------------------------------------------------------
-    char decrypted_data[DATA_SIZE + 1];
+    // ---- 1. DEFERRED VERIFICATION (Parallelized in worker pool) -----------
+    // pkt is still in wire-format (big-endian)
+    uint8_t received_hmac[16];
+    memcpy(received_hmac, pkt.hmac, 16);
+    memset(pkt.hmac, 0, 16);
+
+    // Security keys are now in constants.h
+    const uint8_t *SHARED_SECRET_KEY = DataBeam::SHARED_SECRET_KEY;
+    if (!verify_hmac((const uint8_t *)&pkt, sizeof(pkt), SHARED_SECRET_KEY,
+                     received_hmac)) {
+      cerr << "[DECOMP] HMAC FAIL seq=" << pkt.seq_num << endl;
+      continue;
+    }
+
+    // Now convert to host-order for CRC and processing
+    deserialize_slim_packet(&pkt);
+
+    uint32_t received_crc = pkt.crc32;
+    pkt.crc32 = 0;
+    uint32_t computed =
+        calculate_crc32(reinterpret_cast<const unsigned char *>(&pkt),
+                        sizeof(SlimDataPacket));
+    pkt.crc32 = received_crc;
+    memcpy(pkt.hmac, received_hmac, 16);
+
+    if (computed != received_crc) {
+      cerr << "[DECOMP] CRC FAIL seq=" << pkt.seq_num << endl;
+      g_perf.crc_fails.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+
+    // ---- 2. DECRYPT & DECOMPRESS -------------------------------------------
+    uint8_t decrypted_data[DataBeam::PACKET_DATA_SIZE + 1];
     long long t_decrypt = PerfStats::now_us();
-    if (!aes_decrypt((const uint8_t *)pkt.data, item.compressed_len,
-                     SHARED_SECRET_KEY, &pkt.packet_iv,
-                     (uint8_t *)decrypted_data)) {
-      cerr << "[DECOMP] Decrypt failed seq=" << pkt.seq_num << endl;
+    if (!aes_decrypt((const uint8_t *)pkt.data, (size_t)pkt.data_len,
+                     SHARED_SECRET_KEY, &pkt.packet_iv, decrypted_data)) {
       continue;
     }
     g_perf.total_decrypt_time_us.fetch_add(PerfStats::now_us() - t_decrypt,
                                            std::memory_order_relaxed);
 
-    // ---- 2. DECOMPRESS -----------------------------------------------------
-    char decompressed_buffer[DATA_SIZE + 1];
+    char decompressed_buffer[DataBeam::PACKET_DATA_SIZE + 1];
     size_t decomp_len = sizeof(decompressed_buffer);
-
     long long decomp_start = PerfStats::now_us();
-    if (pkt.flags & 0x01) { // Bit 0 of flags is compression
-      int ret = decompress_data(decrypted_data, item.compressed_len,
+    if (pkt.flags & 0x01) {
+      int ret = decompress_data((char *)decrypted_data, (size_t)pkt.data_len,
                                 decompressed_buffer, decomp_len);
       g_perf.total_decomp_time_us.fetch_add(PerfStats::now_us() - decomp_start,
                                             std::memory_order_relaxed);
       if (ret != 0) {
-        cerr << "[DECOMP] Decomp failed seq=" << pkt.seq_num << " err=" << ret
-             << endl;
         continue;
       }
     } else {
-      // Uncompressed
-      memcpy(decompressed_buffer, decrypted_data, item.compressed_len);
-      decomp_len = item.compressed_len;
+      memcpy(decompressed_buffer, decrypted_data, pkt.data_len);
+      decomp_len = pkt.data_len;
     }
 
-    // Clear the compression flag for the writer (so EOF check works)
     pkt.flags &= ~0x01;
 
     // ---- 3. STORE IN POOL (atomic handoff to writer) -----------------------
-    int idx = pkt.seq_num % BUFFER_SIZE;
-    PoolSlot &slot = g_pool[idx];
+    uint32_t pool_idx = pkt.seq_num % DataBeam::SERVER_RECV_BUFFER_SIZE;
+    PoolSlot &slot = g_pool[pool_idx];
 
-    // Spin-wait if slot is still occupied (backpressure from slow writer)
     while (slot.ready.load(std::memory_order_acquire) &&
            !server_done.load(std::memory_order_relaxed)) {
       g_perf.pool_spin_events.fetch_add(1, std::memory_order_relaxed);
@@ -245,14 +261,11 @@ void *decompressor_thread(void *arg) {
     if (server_done.load(std::memory_order_relaxed))
       break;
 
-    // Write all data fields BEFORE setting ready flag
     memcpy(slot.data, decompressed_buffer, decomp_len);
     slot.data_len = decomp_len;
     slot.type = pkt.type;
     slot.chunk_offset = pkt.chunk_offset;
     slot.seq_num = pkt.seq_num;
-
-    // Release fence: all writes above visible to writer's acquire load
     slot.ready.store(true, std::memory_order_release);
 
     g_perf.packets_processed.fetch_add(1, std::memory_order_relaxed);
@@ -311,8 +324,7 @@ void *writer_thread(void *arg) {
        << ". Expecting seq=" << expected_seq_num << endl;
 
   // ── 1MB staging buffer ────────────────────────────────────────────────────
-  static const size_t BUNCH_CAPACITY = 1u * 1024u * 1024u;
-  char *bunch_buffer = new char[BUNCH_CAPACITY];
+  char *bunch_buffer = new char[DataBeam::SERVER_BUNCH_CAPACITY];
   size_t bunch_size = 0;
   uint64_t bunch_start_offset = 0;
   bool transfer_success = false;
@@ -337,14 +349,14 @@ void *writer_thread(void *arg) {
 
   // ── Main writer loop ─────────────────────────────────────────────────────
   while (!server_done.load(std::memory_order_relaxed)) {
-    int idx = expected_seq_num % BUFFER_SIZE;
+    int idx = expected_seq_num & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1);
     PoolSlot &slot = g_pool[idx];
 
     // Check if the next expected slot is ready
     if (!slot.ready.load(std::memory_order_acquire)) {
       // Not ready — check if all decompressors finished (nothing more coming)
       if (decompressors_done.load(std::memory_order_acquire) ==
-              DECOMPRESSOR_THREADS &&
+              DataBeam::SERVER_DECOMPRESSOR_THREADS &&
           work_queue.size_approx() == 0) {
         // No more data will ever arrive for this slot
         break;
@@ -355,7 +367,12 @@ void *writer_thread(void *arg) {
 
     // Verify correct sequence (not stale data from a previous window cycle)
     if (slot.seq_num != expected_seq_num) {
-      slot.ready.store(false, std::memory_order_release);
+      // This slot contains data from a FUTURE window cycle or is stale.
+      // With BUFFER_SIZE >> WINDOW_SIZE, this is rare.
+      // We must NOT clear ready here if it's from the future.
+      if (slot.seq_num < expected_seq_num) {
+        slot.ready.store(false, std::memory_order_release);
+      }
       SwitchToThread();
       continue;
     }
@@ -365,7 +382,7 @@ void *writer_thread(void *arg) {
       bunch_start_offset = slot.chunk_offset;
 
     // Flush if this slot would overflow the staging buffer
-    if (bunch_size + slot.data_len > BUNCH_CAPACITY) {
+    if (bunch_size + slot.data_len > DataBeam::SERVER_BUNCH_CAPACITY) {
       flush_bunch();
       bunch_start_offset = slot.chunk_offset;
     }
@@ -379,7 +396,7 @@ void *writer_thread(void *arg) {
     slot.ready.store(false, std::memory_order_release);
     expected_seq_num++;
 
-    if (expected_seq_num % 1000 == 0)
+    if (expected_seq_num % DataBeam::CHECKPOINT_INTERVAL_PACKETS == 0)
       save_checkpoint(current_filename, expected_seq_num);
 
     if (hit_eof) {
@@ -434,7 +451,7 @@ int main() {
   create_received_dir();
 
   // Allocate pool on heap (~6MB: 4096 slots × ~1.5KB each)
-  g_pool = new PoolSlot[BUFFER_SIZE]();
+  g_pool = new PoolSlot[DataBeam::SERVER_RECV_BUFFER_SIZE]();
 
   SOCKET sockfd = socket(AF_INET, SOCK_DGRAM, 0);
   if (sockfd == INVALID_SOCKET) {
@@ -443,40 +460,40 @@ int main() {
   }
 
   // 64MB socket buffers — absorb bursts without dropping
-  int buf_size = SOC_BUFFER * 1024 * 1024;
+  int buf_size = DataBeam::SERVER_SOCKET_BUFFER_MB * 1024 * 1024;
   setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&buf_size,
              sizeof(buf_size));
   setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buf_size,
              sizeof(buf_size));
 
   // 100ms recv timeout — 10× more responsive than before
-  DWORD recv_timeout_ms = RECV_TIMEOUT;
+  DWORD recv_timeout_ms = DataBeam::RECV_TIMEOUT_MS;
   setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&recv_timeout_ms,
              sizeof(recv_timeout_ms));
 
   struct sockaddr_in server_addr = {};
   server_addr.sin_family = AF_INET;
   server_addr.sin_addr.s_addr = INADDR_ANY;
-  server_addr.sin_port = htons(PORT);
+  server_addr.sin_port = htons(DataBeam::DEFAULT_PORT);
 
   if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
     cerr << " Bind failed." << endl;
     return 1;
   }
-  cout << " Listening on port " << PORT << "..." << endl;
-  cout << " Pipeline: " << DECOMPRESSOR_THREADS << " decompressors, 1 writer"
+  cout << " Listening on port " << DataBeam::DEFAULT_PORT << "..." << endl;
+  cout << " Pipeline: " << DataBeam::SERVER_DECOMPRESSOR_THREADS << " decompressors, 1 writer"
        << endl;
-  cout << " Socket buffers: " << SOC_BUFFER
-       << "MB, Recv timeout: " << RECV_TIMEOUT << "ms" << endl;
+  cout << " Socket buffers: " << DataBeam::SERVER_SOCKET_BUFFER_MB
+       << "MB, Recv timeout: " << DataBeam::RECV_TIMEOUT_MS << "ms" << endl;
 
   struct sockaddr_in client_addr;
   socklen_t addr_len = sizeof(client_addr);
 
   // ── Launch pipeline threads ───────────────────────────────────────────────
-  pthread_t t_decompressors[DECOMPRESSOR_THREADS];
+  pthread_t t_decompressors[DataBeam::SERVER_DECOMPRESSOR_THREADS];
   pthread_t t_writer, t_logger;
 
-  for (int i = 0; i < DECOMPRESSOR_THREADS; i++)
+  for (int i = 0; i < DataBeam::SERVER_DECOMPRESSOR_THREADS; i++)
     pthread_create(&t_decompressors[i], nullptr, decompressor_thread, nullptr);
   pthread_create(&t_writer, nullptr, writer_thread, nullptr);
   // pthread_create(&t_logger, nullptr, logger_thread, nullptr);
@@ -484,7 +501,7 @@ int main() {
   // ── Hybrid SACK state ────────────────────────────────────────────────────
   int ack_counter = 0;
   int hole_sack_counter = 0;
-  uint32_t recv_mark[BUFFER_SIZE];
+  uint32_t recv_mark[DataBeam::SERVER_RECV_BUFFER_SIZE];
   memset(recv_mark, 0, sizeof(recv_mark));
 
   int idle_timeouts = 0;
@@ -514,9 +531,9 @@ int main() {
         int err = WSAGetLastError();
         if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
           idle_timeouts++;
-          if (idle_timeouts > IDLE_TIMEOUT_COUNT) {
+          if (idle_timeouts > DataBeam::IDLE_TIMEOUT_COUNT) {
             cerr << "\n[SERVER] Client inactivity timeout ("
-                 << (IDLE_TIMEOUT_COUNT * RECV_TIMEOUT / 1000)
+                 << (DataBeam::IDLE_TIMEOUT_COUNT * DataBeam::RECV_TIMEOUT_MS / DataBeam::MS_PER_SEC)
                  << "s). Aborting transfer..." << endl;
             server_done.store(true, std::memory_order_relaxed);
             break;
@@ -585,86 +602,47 @@ int main() {
       if (!start_received.load(std::memory_order_relaxed))
         continue;
 
-      if (bytes_recv < (int)(sizeof(SlimDataPacket) - DATA_SIZE)) {
-        cerr << "[SERVER] Short data packet — dropping" << endl;
+      if (bytes_recv < (int)(sizeof(SlimDataPacket) - DataBeam::PACKET_DATA_SIZE)) {
+        cerr << "[NET] Dropped small packet: " << bytes_recv << " bytes" << endl;
         continue;
       }
 
+      // ── DATA PACKET: DEFER VERIFICATION ──────────────────────────────
+      // This is the primary speed boost: purely copy and peek seq_num
       SlimDataPacket pkt;
-      memset(&pkt, 0, sizeof(pkt));
-      memcpy(&pkt, raw_buffer, min((size_t)bytes_recv, sizeof(pkt)));
+      memcpy(&pkt, raw_buffer, sizeof(pkt));
 
-      // ── HMAC Verification ──────────────────────────────────────────────
-      uint8_t received_hmac[16];
-      memcpy(received_hmac, pkt.hmac, 16);
-      memset(pkt.hmac, 0, 16);
-
-      if (!verify_hmac((const uint8_t *)&pkt, sizeof(pkt), SHARED_SECRET_KEY,
-                       received_hmac)) {
-        cerr << "[SERVER] HMAC FAIL seq=" << ntohl(pkt.seq_num) << endl;
-        continue;
-      }
-
-      deserialize_slim_packet(&pkt);
-      size_t compressed_len = pkt.data_len;
-
-      if (compressed_len == 0 || compressed_len > (size_t)(DATA_SIZE + 1)) {
-        cerr << "[SERVER] Bad data_len=" << compressed_len
-             << " seq=" << pkt.seq_num << endl;
-        continue;
-      }
-
-      // ── CRC Check ─────────────────────────────────────────────────────
-      uint32_t received_crc = pkt.crc32;
-      pkt.crc32 = 0;
-      uint32_t computed =
-          calculate_crc32(reinterpret_cast<const unsigned char *>(&pkt),
-                          sizeof(SlimDataPacket));
-      pkt.crc32 = received_crc;
-      memcpy(pkt.hmac, received_hmac, 16);
-
-      if (computed != received_crc) {
-        cerr << "[SERVER] CRC FAIL seq=" << pkt.seq_num << " expected=0x" << hex
-             << received_crc << " got=0x" << computed << dec << endl;
-        g_perf.crc_fails.fetch_add(1, std::memory_order_relaxed);
-        continue;
-      }
+      // Extract seq_num/type manually from big-endian wire format for SACK processing.
+      // WE DO NOT modify pkt itself here because HMAC verification in the 
+      // decompressor thread needs the packet to be in its original wire format.
+      uint32_t net_seq;
+      memcpy(&net_seq, raw_buffer + 1, 4);
+      uint32_t peek_seq = ntohl(net_seq);
+      uint8_t peek_type = raw_buffer[0];
 
       // ── Hybrid SACK: track, decide, and send ──────────────────────────
       bool duplicate = false;
-      if (pkt.seq_num < g_ack_seq.load()) {
+      if (peek_seq < g_ack_seq.load()) {
         duplicate = true;
-      } else if (pkt.seq_num >= g_ack_seq.load() &&
-                 pkt.seq_num < g_ack_seq.load() + BUFFER_SIZE) {
-        if (recv_mark[pkt.seq_num % BUFFER_SIZE] == pkt.seq_num) {
+      } else if (peek_seq >= g_ack_seq.load() &&
+                 peek_seq < g_ack_seq.load() + DataBeam::SERVER_RECV_BUFFER_SIZE) {
+        if (recv_mark[peek_seq & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1)] == peek_seq) {
           duplicate = true;
         }
-        recv_mark[pkt.seq_num % BUFFER_SIZE] = pkt.seq_num;
+        recv_mark[peek_seq & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1)] = peek_seq;
       }
 
-      // if (duplicate) {
-      //   // Silently ignore strictly-in-window true duplicates as network
-      //   echoes
-      //   // are common, but if it's wildly out of order this helps debug:
-      //   // if (pkt.seq_num < g_ack_seq.load() &&
-      //   //     (g_ack_seq.load() - pkt.seq_num) > 1000) {
-      //   //   cerr << " [DEBUG] Wildly late duplicate received: seq=" <<
-      //   pkt.seq_num
-      //   //        << " (ack_seq=" << g_ack_seq.load() << ")" << endl;
-      //   // }
-      // }
-
-      bool hole_detected = (pkt.seq_num > g_ack_seq.load());
-      bool is_eof = (pkt.type == 3);
+      bool hole_detected = (peek_seq > g_ack_seq.load());
+      bool is_eof = (peek_type == 3);
       bool gap_filled = false;
 
       // Advance cumulative watermark
-      if (pkt.seq_num == g_ack_seq.load()) {
+      if (peek_seq == g_ack_seq.load()) {
         uint32_t before = g_ack_seq.load();
-        while (recv_mark[g_ack_seq.load() % BUFFER_SIZE] == g_ack_seq.load()) {
+        while (recv_mark[g_ack_seq.load() & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1)] == g_ack_seq.load()) {
           // CRITICAL: Clear the mark so it doesn't interfere with the NEXT
           // rotation
-          recv_mark[g_ack_seq.load() % BUFFER_SIZE] = 0;
+          recv_mark[g_ack_seq.load() & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1)] = 0;
           g_ack_seq.fetch_add(1);
         }
         gap_filled = (g_ack_seq.load() > before + 1);
@@ -672,7 +650,8 @@ int main() {
       }
 
       // Rate-limit hole SACKs (1 per 32 in-order or on any OOO event)
-      bool send_sack = (hole_detected) || is_eof || gap_filled || duplicate || (ack_counter >= 32);
+      bool send_sack = (hole_detected) || is_eof || gap_filled || duplicate ||
+                       (ack_counter >= DataBeam::SERVER_ACK_BATCH_SIZE);
 
       if (send_sack) {
         ACKPacket sack;
@@ -681,9 +660,9 @@ int main() {
         sack.ack_num = g_ack_seq.load();
 
         // Build SACK bitmap: bit i = 1 if (ack_seq + i) already buffered
-        for (int i = 0; i < 4096; i++) {
+        for (int i = 0; i < DataBeam::SR_WINDOW_SIZE; i++) {
           uint32_t c = g_ack_seq.load() + (uint32_t)i;
-          if (recv_mark[c % BUFFER_SIZE] == c) {
+          if (recv_mark[c & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1)] == c) {
             sack.bitmap[i >> 6] |= (1ULL << (i & 63));
           }
         }
@@ -703,7 +682,6 @@ int main() {
       if (!duplicate) {
         WorkItem item;
         item.pkt = pkt;
-        item.compressed_len = compressed_len;
         work_queue.enqueue(item);
       }
 
@@ -741,7 +719,7 @@ int main() {
   net_recv_done.store(true, std::memory_order_release);
 
   // Wait for decompressors to drain the queue
-  for (int i = 0; i < DECOMPRESSOR_THREADS; i++)
+  for (int i = 0; i < DataBeam::SERVER_DECOMPRESSOR_THREADS; i++)
     pthread_join(t_decompressors[i], nullptr);
 
   // Wait for writer to finish (it exits on EOF or termination check)
@@ -771,7 +749,7 @@ int main() {
     cout << "Network Recv:    " << avg_net << " us" << endl;
     cout << "Decrypt:         " << avg_decrypt << " us" << endl;
     cout << "Decompress:      " << avg_decomp << " us (across "
-         << DECOMPRESSOR_THREADS << " threads)" << endl;
+         << DataBeam::SERVER_DECOMPRESSOR_THREADS << " threads)" << endl;
     cout << "Disk Write:      " << avg_disk
          << " us (If high, check SSD/HDD speed)" << endl;
     cout << "CRC Failures:    " << g_perf.crc_fails << endl;

@@ -2,14 +2,20 @@
 #define PACKET_H
 
 #include <stdint.h>
-#include <cstring>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include "./crchw.h" // For CRC32 calculation
-#define PORT 12345
-#define DATA_SIZE 1440 // 1500 - 20 (IP) - 8 (UDP) - 32 (custom header)
-#define MAX_FILENAME 256
-#define USERNAME_MAX 32
+#include <string.h>
+
+#ifdef _WIN32
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+#else
+  #include <arpa/inet.h>
+#endif
+
+#include "./crchw.h"
+#include "constants.h"
 #pragma pack(push, 1)
 static inline uint64_t htonll_portable(uint64_t v)
 {
@@ -27,7 +33,7 @@ static inline uint64_t ntohll_portable(uint64_t v)
 struct ACKPacket
 {
     uint32_t ack_num;    // Cumulative ACK watermark (next seq server needs)
-    uint64_t bitmap[64]; // SACK bitmap: 64 chunks × 64 bits = 4096 bits = SR_WINDOW_SIZE
+    uint64_t bitmap[DataBeam::SR_SACK_BITMAP_CHUNKS]; // SACK bitmap: 64 chunks × 64 bits = 4096 bits = SR_WINDOW_SIZE
     uint8_t type;        // Always set to 1 (ACK)
     uint32_t crc32;      // Integrity check for the ACK itself
 };
@@ -50,7 +56,7 @@ struct SlimDataPacket
     uint8_t hmac[16];   // 16 bytes (Auth tag)
 
     // --- 1440 Bytes Payload ---
-    char data[DATA_SIZE]; // The "Cargo"
+    char data[DataBeam::PACKET_DATA_SIZE]; // The "Cargo"
 };
 #pragma pack(pop)
 
@@ -60,8 +66,8 @@ struct StartPacket
     uint8_t type;                // Always 2
     uint32_t file_size;          // Total file size
     uint32_t total_chunks;       // Total number of packets
-    char filename[MAX_FILENAME]; // "stranger_things_s01e01.mkv"
-    char username[USERNAME_MAX]; // "student_id_123"
+    char filename[DataBeam::MAX_FILENAME_LEN]; // "stranger_things_s01e01.mkv"
+    char username[DataBeam::MAX_USERNAME_LEN]; // "student_id_123"
     uint16_t window_size;        // Initial negotiated window
 };
 #pragma pack(pop)
@@ -110,7 +116,7 @@ inline void deserialize_start_packet(struct StartPacket *pkt)
 inline void serialize_ack_packet(struct ACKPacket *pkt)
 {
     pkt->ack_num = htonl(pkt->ack_num);
-    for (int i = 0; i < 64; i++) {
+    for (int i = 0; i < DataBeam::SR_SACK_BITMAP_CHUNKS; i++) {
         pkt->bitmap[i] = htonll(pkt->bitmap[i]);
     }
     pkt->crc32 = htonl(pkt->crc32);
@@ -119,7 +125,7 @@ inline void serialize_ack_packet(struct ACKPacket *pkt)
 inline void deserialize_ack_packet(struct ACKPacket *pkt)
 {
     pkt->ack_num = ntohl(pkt->ack_num);
-    for (int i = 0; i < 64; i++) {
+    for (int i = 0; i < DataBeam::SR_SACK_BITMAP_CHUNKS; i++) {
         pkt->bitmap[i] = ntohll(pkt->bitmap[i]);
     }
     pkt->crc32 = ntohl(pkt->crc32);
