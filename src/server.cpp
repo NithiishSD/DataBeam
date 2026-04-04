@@ -34,8 +34,8 @@ using namespace std;
 #define BUFFER_SIZE 4096 // Must match SR_WINDOW_SIZE (client's sliding window)
 // #define ACK_BATCH_SIZE 32 // Send SACK every N in-order packets
 #define RECV_TIMEOUT 100 // 100ms — responsive to client (was 1000ms)
-#define SOC_BUFFER 64    // 64MB socket buffers (was 32MB)
-#define DECOMPRESSOR_THREADS 2
+#define SOC_BUFFER 16    // 64MB socket buffers (was 32MB)
+#define DECOMPRESSOR_THREADS 4
 #define IDLE_TIMEOUT_COUNT 100 // 100 × 100ms = 10s of true inactivity (was 10s)
 
 // =============================================================================
@@ -100,6 +100,7 @@ PoolSlot *g_pool = nullptr;
 
 // Synchronization flags
 std::atomic<bool> server_done{false};
+std::atomic<uint32_t> g_ack_seq{1};
 std::atomic<bool> net_recv_done{false};
 std::atomic<int> decompressors_done{0};
 
@@ -157,6 +158,16 @@ uint32_t load_checkpoint(const string &target_filename) {
   return (uint32_t)stoul(content.substr(s_start, s_end - s_start));
 }
 
+void *logger_thread(void *arg) {
+  while (!server_done.load(std::memory_order_relaxed)) {
+    Sleep(1000);
+    if (server_done.load(std::memory_order_relaxed))
+      break;
+    cout << "[LOGGER] ack_seq=" << g_ack_seq.load() << endl;
+  }
+  return nullptr;
+}
+
 // =============================================================================
 // DECOMPRESSOR THREAD (×4)
 //
@@ -202,7 +213,7 @@ void *decompressor_thread(void *arg) {
     size_t decomp_len = sizeof(decompressed_buffer);
 
     long long decomp_start = PerfStats::now_us();
-    if (pkt.type & 0x80) {
+    if (pkt.flags & 0x01) { // Bit 0 of flags is compression
       int ret = decompress_data(decrypted_data, item.compressed_len,
                                 decompressed_buffer, decomp_len);
       g_perf.total_decomp_time_us.fetch_add(PerfStats::now_us() - decomp_start,
@@ -219,7 +230,7 @@ void *decompressor_thread(void *arg) {
     }
 
     // Clear the compression flag for the writer (so EOF check works)
-    pkt.type &= ~0x80;
+    pkt.flags &= ~0x01;
 
     // ---- 3. STORE IN POOL (atomic handoff to writer) -----------------------
     int idx = pkt.seq_num % BUFFER_SIZE;
@@ -368,15 +379,18 @@ void *writer_thread(void *arg) {
     slot.ready.store(false, std::memory_order_release);
     expected_seq_num++;
 
-    if (expected_seq_num % 500 == 0)
+    if (expected_seq_num % 1000 == 0)
       save_checkpoint(current_filename, expected_seq_num);
 
     if (hit_eof) {
       flush_bunch();
       transfer_success = true;
-      outfile.flush();
-      outfile.close();
-      remove("resume.json");
+      if (remove("resume.json") == 0) {
+        cout << "[WRITER] Checkpoint deleted successfully." << endl;
+      } else {
+        // If it fails, try one more time now that file is closed
+        remove("resume.json");
+      }
       cout << "[WRITER] Transfer complete: " << out_filepath << endl;
       server_done.store(true, std::memory_order_relaxed);
       break;
@@ -460,14 +474,14 @@ int main() {
 
   // ── Launch pipeline threads ───────────────────────────────────────────────
   pthread_t t_decompressors[DECOMPRESSOR_THREADS];
-  pthread_t t_writer;
+  pthread_t t_writer, t_logger;
 
   for (int i = 0; i < DECOMPRESSOR_THREADS; i++)
     pthread_create(&t_decompressors[i], nullptr, decompressor_thread, nullptr);
   pthread_create(&t_writer, nullptr, writer_thread, nullptr);
+  // pthread_create(&t_logger, nullptr, logger_thread, nullptr);
 
   // ── Hybrid SACK state ────────────────────────────────────────────────────
-  uint32_t ack_seq = 1;
   int ack_counter = 0;
   int hole_sack_counter = 0;
   uint32_t recv_mark[BUFFER_SIZE];
@@ -493,7 +507,7 @@ int main() {
         WSARecvFrom(sockfd, &wsabuf_recv, 1, &bytes_recv_dword, &flags,
                     (struct sockaddr *)&client_addr, &from_len, NULL, NULL);
 
-    int bytes_recv = (result == 0) ? (int)bytes_recv_dword : result;
+    int bytes_recv = (result == 0) ? (int)bytes_recv_dword : -1;
 
     if (bytes_recv <= 0) {
       if (start_received.load(std::memory_order_relaxed)) {
@@ -538,13 +552,14 @@ int main() {
 
       uint32_t saved_seq = load_checkpoint(shared_filename);
       if (saved_seq > 1)
-        ack_seq = saved_seq;
+        g_ack_seq.store(saved_seq);
       pthread_mutex_unlock(&init_mutex);
 
       // Set start_received AFTER init data is written (release semantics)
       start_received.store(true, std::memory_order_release);
 
-      cout << "[SERVER] Connection established! Resume seq=" << ack_seq << endl;
+      cout << "[SERVER] Connection established! Resume seq=" << g_ack_seq.load()
+           << endl;
       cout << "[SERVER] File: " << sp.filename << " (" << sp.file_size
            << " bytes, " << sp.total_chunks << " chunks)" << endl;
 
@@ -617,53 +632,57 @@ int main() {
 
       // ── Hybrid SACK: track, decide, and send ──────────────────────────
       bool duplicate = false;
-      if (pkt.seq_num < ack_seq) {
+      if (pkt.seq_num < g_ack_seq.load()) {
         duplicate = true;
-      } else if (pkt.seq_num >= ack_seq &&
-                 pkt.seq_num < ack_seq + BUFFER_SIZE) {
+      } else if (pkt.seq_num >= g_ack_seq.load() &&
+                 pkt.seq_num < g_ack_seq.load() + BUFFER_SIZE) {
         if (recv_mark[pkt.seq_num % BUFFER_SIZE] == pkt.seq_num) {
           duplicate = true;
         }
         recv_mark[pkt.seq_num % BUFFER_SIZE] = pkt.seq_num;
       }
 
-      if (duplicate) {
-        // Silently ignore strictly-in-window true duplicates as network echoes
-        // are common, but if it's wildly out of order this helps debug:
-        if (pkt.seq_num < ack_seq && (ack_seq - pkt.seq_num) > 1000) {
-          cerr << " [DEBUG] Wildly late duplicate received: seq=" << pkt.seq_num
-               << " (ack_seq=" << ack_seq << ")" << endl;
-        }
-      }
+      // if (duplicate) {
+      //   // Silently ignore strictly-in-window true duplicates as network
+      //   echoes
+      //   // are common, but if it's wildly out of order this helps debug:
+      //   // if (pkt.seq_num < g_ack_seq.load() &&
+      //   //     (g_ack_seq.load() - pkt.seq_num) > 1000) {
+      //   //   cerr << " [DEBUG] Wildly late duplicate received: seq=" <<
+      //   pkt.seq_num
+      //   //        << " (ack_seq=" << g_ack_seq.load() << ")" << endl;
+      //   // }
+      // }
 
-      bool hole_detected = (pkt.seq_num > ack_seq);
+      bool hole_detected = (pkt.seq_num > g_ack_seq.load());
       bool is_eof = (pkt.type == 3);
       bool gap_filled = false;
 
       // Advance cumulative watermark
-      if (pkt.seq_num == ack_seq) {
-        uint32_t before = ack_seq;
-        while (recv_mark[ack_seq % BUFFER_SIZE] == ack_seq) {
-          recv_mark[ack_seq % BUFFER_SIZE] = 0;
-          ack_seq++;
+      if (pkt.seq_num == g_ack_seq.load()) {
+        uint32_t before = g_ack_seq.load();
+        while (recv_mark[g_ack_seq.load() % BUFFER_SIZE] == g_ack_seq.load()) {
+          // CRITICAL: Clear the mark so it doesn't interfere with the NEXT
+          // rotation
+          recv_mark[g_ack_seq.load() % BUFFER_SIZE] = 0;
+          g_ack_seq.fetch_add(1);
         }
-        gap_filled = (ack_seq > before + 1);
+        gap_filled = (g_ack_seq.load() > before + 1);
         ack_counter++;
       }
 
-      // Rate-limit hole SACKs (1 per 8 OOO events)
-      bool send_sack = (hole_detected && (++hole_sack_counter % 8 == 0)) ||
-                       is_eof || gap_filled || duplicate;
+      // Rate-limit hole SACKs (1 per 32 in-order or on any OOO event)
+      bool send_sack = (hole_detected) || is_eof || gap_filled || duplicate || (ack_counter >= 32);
 
       if (send_sack) {
         ACKPacket sack;
         memset(&sack, 0, sizeof(sack));
         sack.type = 1;
-        sack.ack_num = ack_seq;
+        sack.ack_num = g_ack_seq.load();
 
         // Build SACK bitmap: bit i = 1 if (ack_seq + i) already buffered
         for (int i = 0; i < 4096; i++) {
-          uint32_t c = ack_seq + (uint32_t)i;
+          uint32_t c = g_ack_seq.load() + (uint32_t)i;
           if (recv_mark[c % BUFFER_SIZE] == c) {
             sack.bitmap[i >> 6] |= (1ULL << (i & 63));
           }
@@ -728,6 +747,7 @@ int main() {
   // Wait for writer to finish (it exits on EOF or termination check)
   // DO NOT set server_done before this — writer needs to finish processing
   pthread_join(t_writer, nullptr);
+  // pthread_join(t_logger, nullptr);
 
   server_done.store(true, std::memory_order_relaxed); // safety net for cleanup
 

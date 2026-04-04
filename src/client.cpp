@@ -11,7 +11,6 @@
 #include "./headers/concurrentqueue.h"
 #include <atomic>
 #include <chrono>
-#include <signal.h>
 #include <cstring>
 #include <filesystem> // C++17
 #include <fstream>
@@ -20,6 +19,7 @@
 #include <iostream>
 #include <map>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
@@ -32,8 +32,9 @@
 #include "./headers/packet.h"
 #include "./headers/ringbuf.h"
 #include "./headers/selectrepeat.h"
-#define BITMAP_ACK 4096 // Bitmap covers the full SR_WINDOW_SIZE (64 chunks × 64 bits)
-#define SOC_BUFFER 128   // Socket buffer size in MB (both send and receive)
+#define BITMAP_ACK \
+  4096                   // Bitmap covers the full SR_WINDOW_SIZE (64 chunks × 64 bits)
+#define SOC_BUFFER 16    // Socket buffer size in MB (both send and receive)
 #define RECV_TIMEOUT 100 // 30-second recv timeout for ACKs
 // #define BITMAP_SIZE 512 // Bitmap size ACKs cover 1024 packets beyond the
 // cumulative ACK set 20% of window size Number of compressor threads -- tune to
@@ -44,7 +45,8 @@ using namespace std;
 static const size_t RAW_Q_CAP = 8192; // always 2*windowsize
 static const size_t READY_Q_CAP = 8192;
 
-struct ClientPerf {
+struct ClientPerf
+{
   // Stage Latencies (Microseconds)
   std::atomic<long long> total_disk_read_us{0};
   std::atomic<long long> total_compress_us{0};
@@ -64,13 +66,15 @@ struct ClientPerf {
   std::atomic<uint32_t> packets_sent{0};
   std::atomic<uint32_t> window_full_events{0};
 
-  static long long now_us() {
+  static long long now_us()
+  {
     return std::chrono::duration_cast<std::chrono::microseconds>(
                std::chrono::high_resolution_clock::now().time_since_epoch())
         .count();
   }
 
-  void reset() {
+  void reset()
+  {
     total_disk_read_us = total_compress_us = total_crypto_us = 0;
     total_send_syscall_us = total_window_wait_us = 0;
     packets_sent = window_full_events = 0;
@@ -78,7 +82,8 @@ struct ClientPerf {
 };
 
 ClientPerf g_cperf; // Global client performance object
-void print_client_report() {
+void print_client_report()
+{
   uint32_t count = g_cperf.packets_sent.load();
   if (count == 0)
     return;
@@ -149,7 +154,8 @@ bool disable_compression = false;
 //      (exponential backoff per RFC 6298), resets to base on successful ACK.
 // max_retransmits: scales with RTO so we don't abort too early under high loss.
 // ----------------------------------------------------------------------------
-struct AdaptiveParams {
+struct AdaptiveParams
+{
   // RTO state
   std::atomic<int> rto_ms{SR_PACKET_TIMEOUT_MS};
   std::atomic<int> consecutive_timeouts{0};
@@ -159,14 +165,16 @@ struct AdaptiveParams {
   // Max retransmits: proportional to how long we're willing to wait
   // Formula: at MIN_RTO each retry costs 50ms → 200*50ms=10s window
   //          at MAX_RTO each retry costs 2000ms → 15 retries = 30s window
-  int get_max_retransmits() const {
+  int get_max_retransmits() const
+  {
     // Allow up to 10 seconds of total retry time per packet
     int budget_ms = 10000;
     return std::max(10, budget_ms / rto_ms.load());
   }
 
   // Called when a packet times out — doubles RTO up to MAX
-  void on_timeout() {
+  void on_timeout()
+  {
     int t = consecutive_timeouts.fetch_add(1) + 1;
     int new_rto =
         SR_PACKET_TIMEOUT_MS * (1 << std::min(t, 5)); // cap doubling at 32x
@@ -174,8 +182,10 @@ struct AdaptiveParams {
   }
 
   // Called when an ACK arrives — resets backoff
-  void on_ack() {
-    if (consecutive_timeouts.load() > 0) {
+  void on_ack()
+  {
+    if (consecutive_timeouts.load() > 0)
+    {
       consecutive_timeouts.store(0);
       rto_ms.store(SR_PACKET_TIMEOUT_MS);
     }
@@ -189,7 +199,8 @@ AdaptiveParams g_adapt;
 
 // ---- Pipeline packet structs -----------------------------------------------
 
-struct RawChunk {
+struct RawChunk
+{
   char data[DATA_SIZE];
   size_t bytes_read;
   uint32_t offset;
@@ -197,7 +208,8 @@ struct RawChunk {
   bool is_last;
 };
 
-struct ReadyPacket {
+struct ReadyPacket
+{
   SlimDataPacket pkt;  // fully built, CRC set, ready to serialize+send
   size_t original_len; // uncompressed chunk size (for counter updates)
 };
@@ -210,7 +222,8 @@ struct ReadyPacket {
 // Capacity must be >= SR_WINDOW_SIZE (4096) and a power of 2.
 // Safety: only the sender thread reads/writes slots, so no lock needed.
 // ============================================================================
-struct ReorderSlot {
+struct ReorderSlot
+{
   ReadyPacket pkt;
   bool valid = false;
 };
@@ -220,12 +233,14 @@ static_assert((SR_WINDOW_SIZE & (SR_WINDOW_SIZE - 1)) == 0,
 static const uint32_t REORDER_CAP = SR_WINDOW_SIZE; // 4096
 static const uint32_t REORDER_MASK = REORDER_CAP - 1;
 
-struct ReorderBuf {
+struct ReorderBuf
+{
   ReorderSlot slots[REORDER_CAP];
   uint32_t pending_count = 0; // how many valid slots are occupied
 
   // Store a packet -- O(1)
-  void insert(uint32_t seq, const ReadyPacket &rp) {
+  void insert(uint32_t seq, const ReadyPacket &rp)
+  {
     uint32_t idx = seq & REORDER_MASK;
     slots[idx].pkt = rp;
     slots[idx].valid = true;
@@ -239,7 +254,8 @@ struct ReorderBuf {
   ReadyPacket &get(uint32_t seq) { return slots[seq & REORDER_MASK].pkt; }
 
   // Mark slot as consumed -- O(1)
-  void erase(uint32_t seq) {
+  void erase(uint32_t seq)
+  {
     slots[seq & REORDER_MASK].valid = false;
     pending_count--;
   }
@@ -257,13 +273,15 @@ atomic<uint32_t> dispatch_seq{1};
 atomic<bool> dispatch_done{false};
 atomic<int> compressors_done{0};
 
-uint32_t get_file_size(const char *filename) {
+uint32_t get_file_size(const char *filename)
+{
   struct _stat64 st;
 
   if (_stat64(filename, &st) != 0)
     return 0;
 
-  if (st.st_size > 0xFFFFFFFF) {
+  if (st.st_size > 0xFFFFFFFF)
+  {
     std::cerr << "[ERROR] File exceeds 4GB limit\n";
     return 0;
   }
@@ -280,7 +298,8 @@ uint32_t get_file_size(const char *filename) {
 // memory manager automatically prefetches sequential pages from the SSD.
 // ============================================================================
 
-void *dispatcher_thread(void *arg) {
+void *dispatcher_thread(void *arg)
+{
   // --- Open file with Win32 API for memory mapping --------------------------
   HANDLE hFile = CreateFileA(
       filename_str, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
@@ -288,7 +307,8 @@ void *dispatcher_thread(void *arg) {
                                  // aggressively
       NULL);
 
-  if (hFile == INVALID_HANDLE_VALUE) {
+  if (hFile == INVALID_HANDLE_VALUE)
+  {
     cerr << " [DISPATCHER] Cannot open file: " << filename_str
          << " (Win32 error " << GetLastError() << ")" << endl;
     dispatch_done.store(true, std::memory_order_release);
@@ -298,7 +318,8 @@ void *dispatcher_thread(void *arg) {
 
   // --- Create file mapping object ------------------------------------------
   HANDLE hMapping = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-  if (hMapping == NULL) {
+  if (hMapping == NULL)
+  {
     cerr << " [DISPATCHER] CreateFileMapping failed (Win32 error "
          << GetLastError() << ")" << endl;
     CloseHandle(hFile);
@@ -310,7 +331,8 @@ void *dispatcher_thread(void *arg) {
   // --- Map entire file into process address space --------------------------
   const char *mapped_ptr =
       (const char *)MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
-  if (mapped_ptr == NULL) {
+  if (mapped_ptr == NULL)
+  {
     cerr << " [DISPATCHER] MapViewOfFile failed (Win32 error " << GetLastError()
          << ")" << endl;
     CloseHandle(hMapping);
@@ -323,15 +345,14 @@ void *dispatcher_thread(void *arg) {
   uint32_t local_offset = chunk_offset; // honours resume checkpoint
   moodycamel::ProducerToken ptok(raw_queue);
 
-  while (local_offset < (uint32_t)file_size && !transfer_complete) {
+  while (local_offset < (uint32_t)file_size && !transfer_complete)
+  {
     // Back-pressure: total pipeline + in-flight must stay under window
-    while (!transfer_complete) {
-      pthread_mutex_lock(&arq_mutex);
+    while (!transfer_complete)
+    {
       int in_flight = arq.get_in_flight_count();
-      pthread_mutex_unlock(&arq_mutex);
-      if (in_flight + (int)raw_queue.size_approx() +
-              (int)ready_queue.size_approx() <
-          SR_WINDOW_SIZE)
+      if (arq.can_send_packet() &&
+          (int)(raw_queue.size_approx() + ready_queue.size_approx()) < SR_WINDOW_SIZE / 4)
         break;
       SwitchToThread();
     }
@@ -380,16 +401,20 @@ void *dispatcher_thread(void *arg) {
 // then pushes ReadyPacket into ready_queue for the sender.
 // ============================================================================
 
-void *compressor_thread(void *arg) {
+void *compressor_thread(void *arg)
+{
   moodycamel::ConsumerToken ctok_raw(raw_queue);
   moodycamel::ProducerToken ptok_ready(ready_queue);
 
-  while (!transfer_complete) {
+  while (!transfer_complete)
+  {
     RawChunk rc;
     bool got = raw_queue.try_dequeue(ctok_raw, rc);
 
-    if (!got) {
-      if (dispatch_done.load(std::memory_order_acquire)) {
+    if (!got)
+    {
+      if (dispatch_done.load(std::memory_order_acquire))
+      {
         // Final check
         got = raw_queue.try_dequeue(ctok_raw, rc);
         if (!got)
@@ -407,9 +432,12 @@ void *compressor_thread(void *arg) {
     long long t_comp = g_cperf.now_us();
     if (!disable_compression &&
         compress_data(rc.data, rc.bytes_read, compressed_data,
-                      compressed_len) == 0) {
+                      compressed_len) == 0)
+    {
       is_compressed = ((uint8_t)compressed_data[0] == 0x01);
-    } else {
+    }
+    else
+    {
       memcpy(compressed_data + 1, rc.data, rc.bytes_read);
       compressed_data[0] = 0x00;
       compressed_len = rc.bytes_read + 1;
@@ -427,7 +455,8 @@ void *compressor_thread(void *arg) {
     long long t_crypto = g_cperf.now_us();
     if (!aes_encrypt((const uint8_t *)compressed_data, compressed_len,
                      SHARED_SECRET_KEY, &rp.pkt.packet_iv,
-                     (uint8_t *)encrypted_data)) {
+                     (uint8_t *)encrypted_data))
+    {
       cerr << " [COMPRESSOR] Encryption failed at seq=" << rc.seq_num << endl;
       transfer_complete = true;
       compressors_done.fetch_add(1, std::memory_order_release);
@@ -472,7 +501,8 @@ void *compressor_thread(void *arg) {
 //   (window has space) it hits the fast-path break immediately.
 // ============================================================================
 
-void *sender_thread(void *arg) {
+void *sender_thread(void *arg)
+{
   // Heap-allocated reorder buffer -- ~6 MB, avoids Windows 1MB thread stack
   // overflow crash
   auto pending = std::make_unique<ReorderBuf>();
@@ -481,28 +511,38 @@ void *sender_thread(void *arg) {
   // Recover starting seq from ARQ send_base (honours resume checkpoint)
   uint32_t next_send_seq = arq.get_send_base();
 
-  while (!transfer_complete) {
+  while (!transfer_complete)
+  {
     // ---- 1. Drain ready_queue into circular reorder buffer (O(1) each) --
     ReadyPacket rp;
     while (ready_queue.try_dequeue(ctok, rp))
       pending->insert(rp.pkt.seq_num, rp);
 
     // ---- 2. Send packets in strict seq_num order ----------------------
-    while (pending->has(next_send_seq)) {
+    while (pending->has(next_send_seq))
+    {
       // Window-space check: only lock when the window might be full
-      pthread_mutex_lock(&arq_mutex);
       int in_flight = arq.get_in_flight_count();
-      pthread_mutex_unlock(&arq_mutex);
 
-      if (in_flight >= SR_WINDOW_SIZE) {
+      if (in_flight >= SR_WINDOW_SIZE)
+      {
         // Window full -- spin until an ACK slides it
         g_cperf.window_full_events.fetch_add(1, std::memory_order_relaxed);
         long long t_wait = g_cperf.now_us();
-        while (!transfer_complete) {
+        // static auto last_warn = chrono::steady_clock::now();
+        // auto now = chrono::steady_clock::now();
+        // if (chrono::duration_cast<chrono::milliseconds>(now - last_warn).count() > 1000)
+        // {
+        //   cout << "[SENDER] Window full: in_flight=" << in_flight
+        //        << " send_base=" << arq.get_send_base()
+        //        << " next_seq=" << arq.get_next_seq_num()
+        //        << " ready_q=" << ready_queue.size_approx() << endl;
+        //   last_warn = now;
+        // }
+        while (!transfer_complete)
+        {
           SwitchToThread();
-          pthread_mutex_lock(&arq_mutex);
           in_flight = arq.get_in_flight_count();
-          pthread_mutex_unlock(&arq_mutex);
           if (in_flight < SR_WINDOW_SIZE)
             break;
         }
@@ -541,7 +581,7 @@ void *sender_thread(void *arg) {
         int err = WSAGetLastError();
         if (err == WSAEWOULDBLOCK || err == WSAENOBUFS)
         {
-          Sleep(1); // Give OS network buffer a chance to drain
+          std::this_thread::sleep_for(std::chrono::microseconds(500));
           continue; // retry same packet
         }
         cerr << " [SENDER] WSASendTo failed: " << err << endl;
@@ -567,12 +607,12 @@ void *sender_thread(void *arg) {
     // ---- 3. Termination check ----------------------------------------
     if (compressors_done.load(std::memory_order_acquire) ==
             COMPRESSOR_THREADS &&
-        ready_queue.size_approx() == 0 && pending->empty()) {
-      pthread_mutex_lock(&arq_mutex);
+        ready_queue.size_approx() == 0 && pending->empty())
+    {
       int in_flight = arq.get_in_flight_count();
-      pthread_mutex_unlock(&arq_mutex);
 
-      if (in_flight == 0) {
+      if (in_flight == 0)
+      {
         transfer_complete = true;
         return nullptr;
       }
@@ -587,44 +627,67 @@ void *sender_thread(void *arg) {
 // ----------------------------------------------------------------------------
 // Receiver Thread
 // ----------------------------------------------------------------------------
-void *receiver_thread(void *arg) {
+void *receiver_thread(void *arg)
+{
   int idle_timeouts = 0;
-  while (!transfer_complete) {
+  while (!transfer_complete)
+  {
     struct ACKPacket ack_pkt;
 
     int bytes_recv = recvfrom(sockfd, (char *)&ack_pkt, sizeof(ack_pkt), 0,
                               (struct sockaddr *)&server_addr, &addr_len);
 
-    if (bytes_recv <= 0) {
+    if (bytes_recv <= 0)
+    {
       int err = WSAGetLastError();
-      if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
+      if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK)
+      {
         idle_timeouts++;
-        if (idle_timeouts > 100) { // 100 * 100ms = 10s inactivity
-          cerr << "\n[CLIENT] Server inactivity timeout (10s). Aborting transfer..." << endl;
+        if (idle_timeouts > 100)
+        { // 100 * 100ms = 10s inactivity
+          cerr << "\n[CLIENT] Server inactivity timeout (10s). Aborting "
+                  "transfer..."
+               << endl;
           ACKPacket abort_ack;
           memset(&abort_ack, 0, sizeof(abort_ack));
           abort_ack.type = 4; // ABORT signal
           abort_ack.ack_num = 0;
           abort_ack.crc32 = compute_ack_crc(&abort_ack);
           serialize_ack_packet(&abort_ack);
-          sendto(sockfd, (const char *)&abort_ack, sizeof(abort_ack), 0, (struct sockaddr *)&server_addr, addr_len);
+          sendto(sockfd, (const char *)&abort_ack, sizeof(abort_ack), 0,
+                 (struct sockaddr *)&server_addr, addr_len);
           transfer_complete = true;
           break;
         }
       }
       continue;
     }
-    
+
     idle_timeouts = 0; // reset on valid packet received
 
-    if (bytes_recv > 0) {
+    if (bytes_recv > 0)
+    {
+      // // Temporary diagnostic — remove after confirming fix
+      // static uint32_t last_reported_base = 0;
+      // uint32_t cur_base = arq.get_send_base();
+      // if (cur_base != last_reported_base)
+      // {
+      //   cout << "[RECV] Window sliding: send_base " << last_reported_base
+      //        << " -> " << cur_base
+      //        << " | in-flight=" << arq.get_in_flight_count() << endl;
+      //   last_reported_base = cur_base;
+      // }
       long long t_start = ClientPerf::now_us();
       deserialize_ack_packet(&ack_pkt);
       uint32_t received_crc = ack_pkt.crc32;
       uint32_t computed = compute_ack_crc(&ack_pkt);
-      if (computed == received_crc) {
-        if (ack_pkt.type == 4) {
-          cerr << "\n[CLIENT] Received ABORT signal from server! Stopping transfer..." << endl;
+      if (computed == received_crc)
+      {
+        if (ack_pkt.type == 4)
+        {
+          cerr << "\n[CLIENT] Received ABORT signal from server! Stopping "
+                  "transfer..."
+               << endl;
           transfer_complete = true;
           continue;
         }
@@ -644,13 +707,18 @@ void *receiver_thread(void *arg) {
         int fast_retransmit_count = 0;
 
         // 2. Mark specific received packets (scan all 64 bitmap chunks)
-        for (int chunk_idx = 0; chunk_idx < 64; chunk_idx++) {
+        for (int chunk_idx = 0; chunk_idx < 64; chunk_idx++)
+        {
           uint64_t chunk = ack_pkt.bitmap[chunk_idx];
-          if (chunk == 0xFFFFFFFFFFFFFFFFULL) {
+          if (chunk == 0xFFFFFFFFFFFFFFFFULL)
+          {
             for (int b = 0; b < 64; b++)
               arq.mark_packet_acked(cum + (chunk_idx * 64) + b);
-          } else if (chunk != 0) {
-            for (int bit = 0; bit < 64; bit++) {
+          }
+          else if (chunk != 0)
+          {
+            for (int bit = 0; bit < 64; bit++)
+            {
               if (chunk & (1ULL << bit))
                 arq.mark_packet_acked(cum + (chunk_idx * 64) + bit);
             }
@@ -663,7 +731,8 @@ void *receiver_thread(void *arg) {
         // Calling on_ack() for every SACK where cum=1 (stuck) defeats the
         // backoff.
         static uint32_t last_cum_ack_seen = 0;
-        if (cum > last_cum_ack_seen) {
+        if (cum > last_cum_ack_seen)
+        {
           g_adapt.on_ack();
           last_cum_ack_seen = cum;
         }
@@ -675,8 +744,10 @@ void *receiver_thread(void *arg) {
 
         // 3. Find highest SACK bit across all 64 chunks
         int max_sack_idx = -1;
-        for (int chunk_idx = 63; chunk_idx >= 0; chunk_idx--) {
-          if (ack_pkt.bitmap[chunk_idx] != 0) {
+        for (int chunk_idx = 63; chunk_idx >= 0; chunk_idx--)
+        {
+          if (ack_pkt.bitmap[chunk_idx] != 0)
+          {
             unsigned long highest_bit = 0;
             _BitScanReverse64(&highest_bit, ack_pkt.bitmap[chunk_idx]);
             max_sack_idx = (chunk_idx * 64) + highest_bit;
@@ -685,36 +756,20 @@ void *receiver_thread(void *arg) {
         }
 
         // 4. Identify holes and schedule fast retransmit (scan all 64 chunks)
-        if (max_sack_idx >= 0) {
-          for (int chunk_idx = 0; chunk_idx < 64; chunk_idx++) {
+        if (max_sack_idx >= 0)
+        {
+          for (int i = 0; i <= max_sack_idx; i++)
+          {
+            int chunk_idx = i >> 6; // i / 64
+            int bit_idx = i & 63;   // i % 64
             uint64_t chunk = ack_pkt.bitmap[chunk_idx];
-            uint64_t holes = ~chunk; // Flip bits: 0s (holes) become 1s
 
-            int base_offset = chunk_idx * 64;
-            if (base_offset > max_sack_idx) {
-              holes = 0; // Everything above max_sack_idx is unsent/unreceived,
-                         // not a hole
-            } else if (base_offset + 63 > max_sack_idx) {
-              int valid_bits = max_sack_idx - base_offset;
-              uint64_t mask = ~0ULL;
-              if (valid_bits < 63) {
-                mask = (1ULL << (valid_bits + 1)) - 1;
-              }
-              holes &= mask;
-            }
-
-            if (holes != 0) {
-              unsigned long bit_pos;
-              // _BitScanForward64 finds the first '1' (our hole) in 1 clock
-              // cycle
-              while (_BitScanForward64(&bit_pos, holes)) {
-                fast_retransmit_seqs[fast_retransmit_count++] =
-                    cum + base_offset + bit_pos;
-                holes &=
-                    ~(1ULL << bit_pos); // Clear this hole to find the next one
-                if (holes == 0)
-                  break;
-              }
+            // If the bit is 0, it's a hole.
+            if (!(chunk & (1ULL << bit_idx)))
+            {
+              fast_retransmit_seqs[fast_retransmit_count++] = cum + i;
+              if (fast_retransmit_count >= BITMAP_ACK)
+                break;
             }
           }
         }
@@ -727,9 +782,11 @@ void *receiver_thread(void *arg) {
         // 5. Fast retransmit OUTSIDE the lock using try_fast_retransmit.
         // This has a built-in cooldown (rto_ms/4) so a flood of SACKs with the
         // same hole does NOT burn through retransmit_count for that packet.
-        for (int i = 0; i < fast_retransmit_count; i++) {
+        for (int i = 0; i < fast_retransmit_count; i++)
+        {
           SlimDataPacket rpkt;
-          if (arq.try_fast_retransmit(fast_retransmit_seqs[i], rpkt)) {
+          if (arq.try_fast_retransmit(fast_retransmit_seqs[i], rpkt))
+          {
             serialize_slim_packet(&rpkt);
             sendto(sockfd, (const char *)&rpkt, sizeof(rpkt), 0,
                    (struct sockaddr *)&server_addr, addr_len);
@@ -741,7 +798,9 @@ void *receiver_thread(void *arg) {
         g_cperf.total_lock_wait_us += (t_locked - t_start);
         g_cperf.total_bit_scan_us += (t_scan_done - t_locked);
         g_cperf.acks_processed++;
-      } else {
+      }
+      else
+      {
         cerr << "[CLIENT] Corrupt ACK dropped! Seq=" << ack_pkt.ack_num << endl;
       }
     }
@@ -755,15 +814,19 @@ void *receiver_thread(void *arg) {
 // max_retransmits is dynamically derived from the current RTO so we never
 // abort prematurely under high latency, nor spin forever under total loss.
 // ----------------------------------------------------------------------------
-void *timeout_thread(void *arg) {
-  while (!transfer_complete) {
+void *timeout_thread(void *arg)
+{
+  while (!transfer_complete)
+  {
     uint32_t timed_out_seq = 0;
 
     pthread_mutex_lock(&arq_mutex);
     timed_out_seq = arq.check_for_timeout();
     pthread_mutex_unlock(&arq_mutex);
 
-    if (timed_out_seq != 0) {
+    if (timed_out_seq != 0)
+    {
+      cout << "[TIMEOUT] Detected timeout for seq=" << timed_out_seq << endl;
       SlimDataPacket retransmit_pkt;
       bool ready = false;
 
@@ -772,7 +835,8 @@ void *timeout_thread(void *arg) {
       int dyn_max = g_adapt.get_max_retransmits();
       arq.set_max_retransmits(dyn_max);
       ready = arq.prepare_retransmit(timed_out_seq, retransmit_pkt);
-      if (ready) {
+      if (ready)
+      {
         retransmissions++;
         g_adapt.on_timeout(); // double the RTO
         // Update ARQ's internal RTO so check_for_timeout uses new value
@@ -780,12 +844,15 @@ void *timeout_thread(void *arg) {
       }
       pthread_mutex_unlock(&arq_mutex);
 
-      if (ready) {
+      if (ready)
+      {
         SlimDataPacket pkt_send = retransmit_pkt;
         serialize_slim_packet(&pkt_send);
         sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
                (struct sockaddr *)&server_addr, addr_len);
-      } else {
+      }
+      else
+      {
         cerr << " [TIMEOUT] Max retries exceeded for seq=" << timed_out_seq
              << ". Aborting." << endl;
         ACKPacket abort_ack;
@@ -794,14 +861,15 @@ void *timeout_thread(void *arg) {
         abort_ack.ack_num = 0;
         abort_ack.crc32 = compute_ack_crc(&abort_ack);
         serialize_ack_packet(&abort_ack);
-        sendto(sockfd, (const char *)&abort_ack, sizeof(abort_ack), 0, (struct sockaddr *)&server_addr, addr_len);
+        sendto(sockfd, (const char *)&abort_ack, sizeof(abort_ack), 0,
+               (struct sockaddr *)&server_addr, addr_len);
         transfer_complete = true;
       }
     }
 
     // Pro-Tip: 5ms is okay for local testing, but for 95 Mbps,
     // a 1ms sleep makes the client respond to loss much faster.
-    Sleep(1);
+    Sleep(3);
   }
   return nullptr;
 }
@@ -809,56 +877,55 @@ void *timeout_thread(void *arg) {
 // ----------------------------------------------------------------------------
 // Logger Thread (UNCHANGED -- currently disabled)
 // ----------------------------------------------------------------------------
-void *logger_thread(void *arg) {
-  while (!transfer_complete) {
-    // Sleep(1000);
-    //  if (transfer_complete)
-    //      break;
-
-    // pthread_mutex_lock(&arq_mutex);
-    // int in_flight = arq.get_in_flight_count();
-    // int acks = acks_received;
-    // int sent = chunks_sent;
-    // // [CHANGED] Print SR window state snapshot instead of cwnd/RTT
-    // //arq.print_window_state();
-    // pthread_mutex_unlock(&arq_mutex);
-    continue;
-    // cout << "[LOGGER] InFlight=" << in_flight << "/" << SR_WINDOW_SIZE
-    //      << " | ACKs=" << acks << "/" << sent << endl;
+void *logger_thread(void *arg)
+{
+  while (!transfer_complete)
+  {
+    Sleep(1000);
+    pthread_mutex_lock(&arq_mutex);
+    uint32_t sb = arq.get_send_base();
+    pthread_mutex_unlock(&arq_mutex);
+    cout << "[LOGGER] send_base=" << sb << endl;
   }
   return nullptr;
 }
 
 void handle_sigint(int sig)
 {
-  cout << "\n[CLIENT] Caught signal " << sig << ", shutting down gracefully..." << endl;
+  cout << "\n[CLIENT] Caught signal " << sig << ", shutting down gracefully..."
+       << endl;
   ACKPacket abort_ack;
   memset(&abort_ack, 0, sizeof(abort_ack));
   abort_ack.type = 4; // ABORT signal
   abort_ack.ack_num = 0;
   abort_ack.crc32 = compute_ack_crc(&abort_ack);
   serialize_ack_packet(&abort_ack);
-  sendto(sockfd, (const char *)&abort_ack, sizeof(abort_ack), 0, (struct sockaddr *)&server_addr, addr_len);
+  sendto(sockfd, (const char *)&abort_ack, sizeof(abort_ack), 0,
+         (struct sockaddr *)&server_addr, addr_len);
   transfer_complete = true;
 }
 
 // ----------------------------------------------------------------------------
 // Main function
 // ----------------------------------------------------------------------------
-int main(int argc, char *argv[]) {
+int main(int argc, char *argv[])
+{
+
   signal(SIGINT, handle_sigint);
   cout << " LinkFlow Phase 5 Client Starting (3-Stage Pipeline + SR ARQ)..."
        << endl;
   cout << "CRC32 hardware acceleration: "
        << (has_hw_crc32() ? "ENABLED (SSE4.2)" : "fallback (slicing-by-8)")
        << endl;
-  if (argc < 2) {
+  if (argc < 2)
+  {
     cerr << "Usage: " << argv[0] << " <filename>" << endl;
     return 1;
   }
 
   WSADATA wsaData;
-  if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+  if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+  {
     cerr << " WSAStartup failed." << endl;
     return 1;
   }
@@ -883,14 +950,16 @@ int main(int argc, char *argv[]) {
       lower_filename.find(".gz") != string::npos ||
       lower_filename.find(".jpg") != string::npos ||
       lower_filename.find(".jpeg") != string::npos ||
-      lower_filename.find(".png") != string::npos) {
+      lower_filename.find(".png") != string::npos)
+  {
     disable_compression = true;
     cout
         << " Auto-detected incompressible file format. Compression is DISABLED."
         << endl;
   }
 
-  if (file_size < 0) {
+  if (file_size < 0)
+  {
     cerr << " Cannot open file: " << filename_str << endl;
     std::cerr << "Reason1: " << std::strerror(errno) << std::endl;
     return 1;
@@ -901,7 +970,8 @@ int main(int argc, char *argv[]) {
        << total_chunks << " chunks)" << endl;
 
   sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-  if (sockfd < 0) {
+  if (sockfd < 0)
+  {
     cerr << "Socket creation failed: " << strerror(errno) << endl;
     return 1;
   }
@@ -920,7 +990,8 @@ int main(int argc, char *argv[]) {
   server_addr.sin_family = AF_INET;
   server_addr.sin_port = htons(PORT);
 
-  if (inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) <= 0) {
+  if (inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) <= 0)
+  {
     cerr << " Invalid address" << endl;
     closesocket(sockfd); // [FIXED] close() → closesocket() on Windows/Winsock
     return 1;
@@ -934,17 +1005,22 @@ int main(int argc, char *argv[]) {
   uint32_t starting_seq = 1;
   uint32_t starting_offset = 0;
   ifstream in("resume.json");
-  if (in.is_open()) {
+
+  if (in.is_open())
+  {
+
     stringstream buf;
     buf << in.rdbuf();
     string content = buf.str();
     size_t f_pos = content.find("\"filename\"");
     size_t s_pos = content.find("\"expected_seq\"");
-    if (f_pos != string::npos && s_pos != string::npos) {
+    if (f_pos != string::npos && s_pos != string::npos)
+    {
       size_t f_start = content.find("\"", f_pos + 10) + 1;
       size_t f_end = content.find("\"", f_start);
       string saved = content.substr(f_start, f_end - f_start);
-      if (saved == filename) {
+      if (saved == filename)
+      {
         size_t s_start = content.find(":", s_pos) + 1;
         while (isspace(content[s_start]))
           s_start++;
@@ -954,7 +1030,13 @@ int main(int argc, char *argv[]) {
         uint32_t expected_seq =
             (uint32_t)stoul(content.substr(s_start, s_end - s_start));
         starting_seq = expected_seq;
-        starting_offset = (expected_seq - 1) * DATA_SIZE;
+        starting_offset = (uint32_t)(expected_seq - 1) * DATA_SIZE;
+        if (starting_seq > total_chunks) {
+          cout << " File already 100% complete according to checkpoint. "
+                  "Skipping transfer."
+               << endl;
+          return 0;
+        }
         cout << " Resuming transfer from checkpoint: seq=" << starting_seq
              << ", offset=" << starting_offset << endl;
       }
@@ -983,36 +1065,42 @@ int main(int argc, char *argv[]) {
   sendto(sockfd, (const char *)&start_pkt, sizeof(start_pkt), 0,
          (struct sockaddr *)&server_addr, addr_len);
   cout << "[CLIENT] Waiting for server handshake..." << endl;
+
   bool handshake_done = false;
   auto handshake_start = chrono::steady_clock::now();
 
-  while (!handshake_done) {
+  while (!handshake_done)
+  {
     ACKPacket ack;
     int r = recvfrom(sockfd, (char *)&ack, sizeof(ack), 0,
                      (struct sockaddr *)&server_addr, &addr_len);
-    if (r > 0) {
+    if (r > 0)
+    {
       deserialize_ack_packet(&ack);
       uint32_t received_crc = ack.crc32;
       uint32_t computed = compute_ack_crc(&ack);
 
-      if (computed == received_crc && ack.ack_num == 0 && ack.type == 1) {
+      if (computed == received_crc && ack.ack_num == 0 && ack.type == 1)
+      {
         cout << "[CLIENT] Handshake confirmed! Server ready." << endl;
         cout << "[CLIENT] Starting data transfer in 200ms..." << endl;
         Sleep(200); // brief pause — matches server's Sleep(200)
         handshake_done = true;
+        break;
       }
     }
 
     // Timeout — retransmit StartPacket
     auto elapsed = chrono::steady_clock::now() - handshake_start;
-    if (chrono::duration_cast<chrono::milliseconds>(elapsed).count() > 1000) {
+    if (chrono::duration_cast<chrono::milliseconds>(elapsed).count() > 1000)
+    {
       cout << "[CLIENT] No handshake response -- retrying StartPacket..."
            << endl;
       StartPacket start_pkt;
       start_pkt.type = 2;
       start_pkt.file_size = file_size;
       start_pkt.total_chunks = total_chunks;
-      strncpy(start_pkt.filename, filename.c_str(), 256);
+      strncpy(start_pkt.filename, filename.c_str(), MAX_FILENAME);
       serialize_start_packet(&start_pkt);
       sendto(sockfd, (const char *)&start_pkt, sizeof(start_pkt), 0,
              (struct sockaddr *)&server_addr, addr_len);
@@ -1023,14 +1111,16 @@ int main(int argc, char *argv[]) {
   // ---- Launch 3-stage pipeline + receiver + timeout threads ----
   pthread_t t_dispatcher;
   pthread_t t_compressors[COMPRESSOR_THREADS];
-  pthread_t t_sender, t_receiver, t_timeout;
-
+  pthread_t t_sender, t_timeout;
+  pthread_t t_receiver;
+  // pthread_t t_logger;
+  pthread_create(&t_receiver, nullptr, receiver_thread, nullptr);
+  pthread_create(&t_timeout, nullptr, timeout_thread, nullptr);
   pthread_create(&t_dispatcher, nullptr, dispatcher_thread, nullptr);
+
   for (int i = 0; i < COMPRESSOR_THREADS; i++)
     pthread_create(&t_compressors[i], nullptr, compressor_thread, nullptr);
   pthread_create(&t_sender, nullptr, sender_thread, nullptr);
-  pthread_create(&t_receiver, nullptr, receiver_thread, nullptr);
-  pthread_create(&t_timeout, nullptr, timeout_thread, nullptr);
   // pthread_create(&t_logger, nullptr, logger_thread, nullptr);
 
   pthread_join(t_dispatcher, nullptr);

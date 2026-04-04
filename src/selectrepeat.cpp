@@ -15,7 +15,8 @@ SelectiveRepeatARQ::SelectiveRepeatARQ()
       max_retransmits(SR_MAX_RETRANSMITS), in_flight_count(0)
 {
     pthread_mutex_init(&window_mutex, NULL);
-    for (int i = 0; i < SR_WINDOW_SIZE; i++) {
+    for (int i = 0; i < SR_WINDOW_SIZE; i++)
+    {
         slot_occupied[i] = false;
     }
 }
@@ -27,11 +28,14 @@ SelectiveRepeatARQ::~SelectiveRepeatARQ()
 }
 
 // Check if we can send another packet (window not full)
+// FIXED — uses exact window range, not approximate count
 bool SelectiveRepeatARQ::can_send_packet() const
 {
-    // [FIX Bug 5] Don't use (next_seq_num - send_base) — it underflows on uint32 wrap.
-    // in_flight_count is the authoritative in-flight count.
-    return get_in_flight_count() < SR_WINDOW_SIZE;
+    pthread_mutex_lock(&window_mutex);
+    // uint32 subtraction wraps correctly even across seq=0 boundary
+    uint32_t in_use = next_seq_num - send_base;
+    pthread_mutex_unlock(&window_mutex);
+    return in_use < (uint32_t)SR_WINDOW_SIZE;
 }
 
 // Get number of packets currently in flight
@@ -47,7 +51,8 @@ void SelectiveRepeatARQ::set_start_seq(uint32_t seq)
     pthread_mutex_lock(&window_mutex);
     send_base = seq;
     next_seq_num = seq;
-    for (int i = 0; i < SR_WINDOW_SIZE; i++) {
+    for (int i = 0; i < SR_WINDOW_SIZE; i++)
+    {
         slot_occupied[i] = false;
     }
     in_flight_count.store(0, std::memory_order_relaxed);
@@ -61,16 +66,28 @@ void SelectiveRepeatARQ::record_sent_packet(const SlimDataPacket &pkt)
     pthread_mutex_lock(&window_mutex);
 
     uint32_t idx = pkt.seq_num & (SR_WINDOW_SIZE - 1);
+
+    // COLLISION GUARD: if slot occupied by a DIFFERENT seq, window overflow
+    // This should never fire after the can_send_packet fix
+    if (slot_occupied[idx] && window_buffer[idx].pkt.seq_num != pkt.seq_num)
+    {
+        cerr << "[ARQ] FATAL COLLISION at slot=" << idx
+             << " existing_seq=" << window_buffer[idx].pkt.seq_num
+             << " new_seq=" << pkt.seq_num
+             << " send_base=" << send_base
+             << " next_seq=" << next_seq_num << endl;
+        pthread_mutex_unlock(&window_mutex);
+        return; // refuse to corrupt — sender will retry after timeout
+    }
+
     WindowPacket &wp = window_buffer[idx];
-    
     wp.pkt = pkt;
     wp.is_acked = false;
     wp.retransmit_count = 0;
-
-    // Capture current time with CLOCK_MONOTONIC for precise RTT measurement
     clock_gettime(CLOCK_MONOTONIC, &wp.send_time);
 
-    if (!slot_occupied[idx]) {
+    if (!slot_occupied[idx])
+    {
         slot_occupied[idx] = true;
         in_flight_count.fetch_add(1, std::memory_order_relaxed);
     }
@@ -117,9 +134,11 @@ void SelectiveRepeatARQ::handle_cumulative_ack(uint32_t cum_ack)
     }
 
     // Mark slots covered by cumulative ACK as empty
-    for (uint32_t s = send_base; s < cum_ack; s++) {
+    for (uint32_t s = send_base; s < cum_ack; s++)
+    {
         uint32_t idx = s & (SR_WINDOW_SIZE - 1);
-        if (slot_occupied[idx] && window_buffer[idx].pkt.seq_num < cum_ack) {
+        if (slot_occupied[idx] && window_buffer[idx].pkt.seq_num < cum_ack)
+        {
             slot_occupied[idx] = false;
             in_flight_count.fetch_sub(1, std::memory_order_relaxed);
         }
@@ -131,7 +150,6 @@ void SelectiveRepeatARQ::handle_cumulative_ack(uint32_t cum_ack)
 
     pthread_mutex_unlock(&window_mutex);
 }
-
 
 // Mark a specific packet as acknowledged
 void SelectiveRepeatARQ::mark_packet_acked(uint32_t seq_num)
@@ -169,7 +187,7 @@ void SelectiveRepeatARQ::advance_window()
             // Clear slot
             slot_occupied[idx] = false;
             in_flight_count.fetch_sub(1, std::memory_order_relaxed);
-            
+
             // Slide window forward
             send_base++;
 
@@ -177,7 +195,8 @@ void SelectiveRepeatARQ::advance_window()
             ack_bitmap >>= 1;
             ack_bitmap[SR_WINDOW_SIZE - 1] = 0;
         }
-        else {
+        else
+        {
             break;
         }
     }
@@ -199,8 +218,15 @@ uint32_t SelectiveRepeatARQ::check_for_timeout()
         uint32_t seq_to_check = send_base + count;
         uint32_t idx = seq_to_check & (SR_WINDOW_SIZE - 1);
 
-        if (!slot_occupied[idx]) continue;
-        if (window_buffer[idx].pkt.seq_num != seq_to_check) continue;
+        // if (seq_to_check == send_base)
+        // {
+        //     cout << "[CHECK] base=" << send_base << " occ=" << slot_occupied[idx] << " acked=" << window_buffer[idx].is_acked << " seq=" << window_buffer[idx].pkt.seq_num << endl;
+        // }
+
+        if (!slot_occupied[idx])
+            continue;
+        if (window_buffer[idx].pkt.seq_num != seq_to_check)
+            continue;
 
         uint32_t seq_num = window_buffer[idx].pkt.seq_num;
         WindowPacket &wp = window_buffer[idx];
@@ -212,6 +238,12 @@ uint32_t SelectiveRepeatARQ::check_for_timeout()
         // Calculate elapsed time in milliseconds
         long elapsed_ms = (now.tv_sec - wp.send_time.tv_sec) * 1000 +
                           (now.tv_nsec - wp.send_time.tv_nsec) / 1000000;
+
+        // if (seq_num == send_base)
+        // {
+        //     cout << "[ARQ DEBUG] base=" << send_base << " acked=" << wp.is_acked
+        //          << " elap=" << elapsed_ms << " rto=" << rto_ms << endl;
+        // }
 
         // Check if timeout exceeded — use the DYNAMIC rto_ms member, not the compile-time macro
         if (elapsed_ms >= (long)rto_ms)
@@ -282,10 +314,11 @@ bool SelectiveRepeatARQ::try_fast_retransmit(uint32_t seq_num, SlimDataPacket &p
     // Cooldown check: skip if retransmitted within rto_ms/4 ago
     timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    long since_ms = (now.tv_sec  - wp.last_retransmit_time.tv_sec)  * 1000 +
+    long since_ms = (now.tv_sec - wp.last_retransmit_time.tv_sec) * 1000 +
                     (now.tv_nsec - wp.last_retransmit_time.tv_nsec) / 1000000;
     long cooldown_ms = (long)(rto_ms) / 4;
-    if (cooldown_ms < 10) cooldown_ms = 10; // floor at 10ms
+    if (cooldown_ms < 10)
+        cooldown_ms = 10; // floor at 10ms
     if (since_ms < cooldown_ms)
     {
         pthread_mutex_unlock(&window_mutex);
@@ -299,7 +332,6 @@ bool SelectiveRepeatARQ::try_fast_retransmit(uint32_t seq_num, SlimDataPacket &p
     pthread_mutex_unlock(&window_mutex);
     return true;
 }
-
 
 bool SelectiveRepeatARQ::get_packet_for_retransmit(uint32_t seq_num, SlimDataPacket &pkt_out)
 {
@@ -344,7 +376,8 @@ void SelectiveRepeatARQ::print_window_state() const
     cout << "   In-flight packets: ";
     for (int i = 0; i < SR_WINDOW_SIZE; i++)
     {
-        if (slot_occupied[i]) {
+        if (slot_occupied[i])
+        {
             cout << "[" << window_buffer[i].pkt.seq_num << (window_buffer[i].is_acked ? "✓" : "✗") << "] ";
         }
     }
