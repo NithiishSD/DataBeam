@@ -23,6 +23,9 @@
 #include "./headers/constants.h"
 #include "./headers/crchw.h"
 #include "./headers/crypto.h"
+#include "./headers/livestate.h"
+#include "./headers/probe.h"
+#include "./headers/sysprofile.h"
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -86,6 +89,14 @@ PerfStats g_perf;
 // =============================================================================
 // Global State
 // =============================================================================
+
+// Phase 6: System profile and dynamic runtime state
+DataBeam::SystemProfile g_profile;
+DataBeam::LiveState g_live;
+uint64_t g_connection_id = 0; // Set during handshake from client's StartPacket
+uint32_t g_pool_size = DataBeam::SERVER_RECV_BUFFER_SIZE; // dynamic, power-of-2
+uint32_t g_pool_mask = DataBeam::SERVER_RECV_BUFFER_SIZE - 1;
+uint32_t g_num_decompressors = DataBeam::SERVER_DECOMPRESSOR_THREADS;
 
 // Lock-free concurrent queue (same moodycamel library as client)
 moodycamel::ConcurrentQueue<WorkItem> work_queue;
@@ -249,7 +260,7 @@ void *decompressor_thread(void *arg) {
     pkt.flags &= ~0x01;
 
     // ---- 3. STORE IN POOL (atomic handoff to writer) -----------------------
-    uint32_t pool_idx = pkt.seq_num & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1);
+    uint32_t pool_idx = pkt.seq_num & g_pool_mask;
     PoolSlot &slot = g_pool[pool_idx];
 
     while (slot.ready.load(std::memory_order_acquire) &&
@@ -348,14 +359,14 @@ void *writer_thread(void *arg) {
 
   // ── Main writer loop ─────────────────────────────────────────────────────
   while (!server_done.load(std::memory_order_relaxed)) {
-    int idx = expected_seq_num & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1);
+    int idx = expected_seq_num & g_pool_mask;
     PoolSlot &slot = g_pool[idx];
 
     // Check if the next expected slot is ready
     if (!slot.ready.load(std::memory_order_acquire)) {
       // Not ready — check if all decompressors finished (nothing more coming)
       if (decompressors_done.load(std::memory_order_acquire) ==
-              DataBeam::SERVER_DECOMPRESSOR_THREADS &&
+              (int)g_num_decompressors &&
           work_queue.size_approx() == 0) {
         // No more data will ever arrive for this slot
         break;
@@ -456,9 +467,17 @@ void *writer_thread(void *arg) {
 // =============================================================================
 int main() {
   signal(SIGINT, handle_sigint);
-  cout << " DataBeam Phase 5 Server Starting (Multi-Threaded Pipeline)..."
+  cout << " DataBeam Phase 6 Server Starting (Autonomous Transport)..."
        << endl;
   SetConsoleOutputCP(CP_UTF8);
+
+  // Phase 6: System Profiling
+  g_profile = DataBeam::SystemProfile::probe();
+  g_profile.print();
+  g_live.init_from_profile(g_profile);
+  g_num_decompressors = g_live.decompressor_threads;
+  g_pool_size = g_live.pool_slot_count;
+  g_pool_mask = g_pool_size - 1;
 
   WSADATA wsaData;
   if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -468,8 +487,10 @@ int main() {
 
   create_received_dir();
 
-  // Allocate pool on heap (~6MB: 4096 slots × ~1.5KB each)
-  g_pool = new PoolSlot[DataBeam::SERVER_RECV_BUFFER_SIZE]();
+  // Phase 6: Dynamic pool allocation based on system profile
+  cout << " Allocating " << g_pool_size << " pool slots (" 
+       << (g_pool_size * sizeof(PoolSlot)) / (1024*1024) << " MB)" << endl;
+  g_pool = new PoolSlot[g_pool_size]();
 
   SOCKET sockfd = socket(AF_INET, SOCK_DGRAM, 0);
   if (sockfd == INVALID_SOCKET) {
@@ -477,14 +498,13 @@ int main() {
     return 1;
   }
 
-  // 64MB socket buffers — absorb bursts without dropping
+  // Socket buffers — absorb bursts without dropping
   int buf_size = DataBeam::SERVER_SOCKET_BUFFER_MB * 1024 * 1024;
   setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&buf_size,
              sizeof(buf_size));
   setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buf_size,
              sizeof(buf_size));
 
-  // 100ms recv timeout — 10× more responsive than before
   DWORD recv_timeout_ms = DataBeam::RECV_TIMEOUT_MS;
   setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&recv_timeout_ms,
              sizeof(recv_timeout_ms));
@@ -493,34 +513,39 @@ int main() {
   server_addr.sin_family = AF_INET;
   server_addr.sin_addr.s_addr = INADDR_ANY;
   server_addr.sin_port = htons(DataBeam::DEFAULT_PORT);
-
   if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
     cerr << " Bind failed." << endl;
     return 1;
   }
   cout << " Listening on port " << DataBeam::DEFAULT_PORT << "..." << endl;
-  cout << " Pipeline: " << DataBeam::SERVER_DECOMPRESSOR_THREADS
+  cout << " Pipeline: " << g_num_decompressors
        << " decompressors, 1 writer" << endl;
-  cout << " Socket buffers: " << DataBeam::SERVER_SOCKET_BUFFER_MB
+  cout << " Pool: " << g_pool_size << " slots, Socket buffers: "
+       << DataBeam::SERVER_SOCKET_BUFFER_MB
        << "MB, Recv timeout: " << DataBeam::RECV_TIMEOUT_MS << "ms" << endl;
 
   struct sockaddr_in client_addr;
   socklen_t addr_len = sizeof(client_addr);
 
-  // ── Launch pipeline threads ───────────────────────────────────────────────
-  pthread_t t_decompressors[DataBeam::SERVER_DECOMPRESSOR_THREADS];
+  // ── Launch pipeline threads (dynamic count from system profile) ──────────
+  pthread_t *t_decompressors = new pthread_t[g_num_decompressors];
   pthread_t t_writer, t_logger;
 
-  for (int i = 0; i < DataBeam::SERVER_DECOMPRESSOR_THREADS; i++)
+  for (uint32_t i = 0; i < g_num_decompressors; i++)
     pthread_create(&t_decompressors[i], nullptr, decompressor_thread, nullptr);
   pthread_create(&t_writer, nullptr, writer_thread, nullptr);
   // pthread_create(&t_logger, nullptr, logger_thread, nullptr);
 
-  // ── Hybrid SACK state ────────────────────────────────────────────────────
+  // ── Hybrid SACK state (dynamic pool size) ─────────────────────────────
   int ack_counter = 0;
   int hole_sack_counter = 0;
-  uint32_t recv_mark[DataBeam::SERVER_RECV_BUFFER_SIZE];
-  memset(recv_mark, 0, sizeof(recv_mark));
+  uint32_t *recv_mark = new uint32_t[g_pool_size]();
+
+  // Phase 6: Probe state
+  int probe_count = 0;
+  int64_t probe_arrival_ns[DataBeam::PROBE_PACKET_COUNT] = {0};
+  int64_t probe_total_bytes = 0;
+  uint64_t probe_first_timestamp_ns = 0;
 
   int idle_timeouts = 0;
   bool is_receiving = true;
@@ -582,6 +607,10 @@ int main() {
       memcpy(&sp, raw_buffer, sizeof(StartPacket));
       deserialize_start_packet(&sp);
 
+      // Phase 6: Store Connection ID from client
+      g_connection_id = sp.connection_id;
+      cout << "[SERVER] Connection ID: 0x" << hex << g_connection_id << dec << endl;
+
       pthread_mutex_lock(&init_mutex);
       shared_filename = string(sp.filename);
       shared_file_size = sp.file_size;
@@ -591,7 +620,6 @@ int main() {
         g_ack_seq.store(saved_seq);
       pthread_mutex_unlock(&init_mutex);
 
-      // Set start_received AFTER init data is written (release semantics)
       start_received.store(true, std::memory_order_release);
 
       cout << "[SERVER] Connection established! Resume seq=" << g_ack_seq.load()
@@ -603,6 +631,7 @@ int main() {
       memset(&start_ack, 0, sizeof(start_ack));
       start_ack.type = 1;
       start_ack.ack_num = 0;
+      start_ack.connection_id = g_connection_id; // Phase 6: CID
       memset(start_ack.bitmap, 0, sizeof(start_ack.bitmap));
       start_ack.crc32 =
           calculate_crc32(reinterpret_cast<const unsigned char *>(&start_ack),
@@ -611,8 +640,67 @@ int main() {
       sendto(sockfd, (const char *)&start_ack, sizeof(start_ack), 0,
              (struct sockaddr *)&client_addr, addr_len);
 
-      cout << "[SERVER] Handshake ACK sent. Waiting for data..." << endl;
+      cout << "[SERVER] Handshake ACK sent. Waiting for probe/data..." << endl;
       Sleep(200);
+    }
+    // ═══════════════════════════════════════════════════════════════════════
+    // PROBE PACKET (type == 5) — Phase 6 Network Probing
+    // ═══════════════════════════════════════════════════════════════════════
+    else if (p_type == DataBeam::PROBE_PACKET_TYPE) {
+      if (!start_received.load(std::memory_order_relaxed))
+        continue;
+
+      ProbePacket pp;
+      memcpy(&pp, raw_buffer, sizeof(ProbePacket));
+      deserialize_probe_packet(&pp);
+
+      // Record arrival time
+      auto now_tp = chrono::high_resolution_clock::now();
+      int64_t arrival_ns = chrono::duration_cast<chrono::nanoseconds>(
+          now_tp.time_since_epoch()).count();
+
+      if (pp.probe_seq < DataBeam::PROBE_PACKET_COUNT) {
+        probe_arrival_ns[pp.probe_seq] = arrival_ns;
+        if (pp.probe_seq == 0)
+          probe_first_timestamp_ns = pp.timestamp_ns;
+        probe_count++;
+        probe_total_bytes += bytes_recv;
+      }
+
+      if (probe_count >= (int)DataBeam::PROBE_PACKET_COUNT) {
+        // Compute bandwidth via inter-packet dispersion
+        int64_t total_ns = probe_arrival_ns[DataBeam::PROBE_PACKET_COUNT - 1]
+                         - probe_arrival_ns[0];
+        uint64_t bandwidth_bps = 0;
+        if (total_ns > 0) {
+          bandwidth_bps = (uint64_t)(
+              (double)probe_total_bytes * 8.0 * 1e9 / (double)total_ns);
+        }
+
+        cout << "[PROBE] Measured bandwidth: " << bandwidth_bps / 1e6
+             << " Mbps (" << probe_count << " packets, "
+             << total_ns / 1e6 << " ms)" << endl;
+
+        // Send ProbeResult back to client
+        ProbeResultPacket result;
+        memset(&result, 0, sizeof(result));
+        result.type = DataBeam::PROBE_RESULT_TYPE;
+        result.bandwidth_bps = bandwidth_bps;
+        result.rtt_echo_ns = probe_first_timestamp_ns;
+        result.recommended_cwnd = std::min(
+            (uint32_t)(bandwidth_bps / 8 / DataBeam::PACKET_DATA_SIZE),
+            (uint32_t)DataBeam::SR_WINDOW_SIZE);
+        result.connection_id = g_connection_id;
+        serialize_probe_result(&result);
+        sendto(sockfd, (const char *)&result, sizeof(result), 0,
+               (struct sockaddr *)&client_addr, addr_len);
+
+        cout << "[PROBE] Sent result: cwnd=" << ntohl(result.recommended_cwnd)
+             << endl;
+        // Reset for potential re-probe
+        probe_count = 0;
+        probe_total_bytes = 0;
+      }
     }
     // ═══════════════════════════════════════════════════════════════════════
     // DATA PACKET (type == 0) or EOF PACKET (type == 3)
@@ -648,12 +736,12 @@ int main() {
         duplicate = true;
       } else if (peek_seq >= g_ack_seq.load() &&
                  peek_seq <
-                     g_ack_seq.load() + DataBeam::SERVER_RECV_BUFFER_SIZE) {
-        if (recv_mark[peek_seq & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1)] ==
+                     g_ack_seq.load() + g_pool_size) {
+        if (recv_mark[peek_seq & g_pool_mask] ==
             peek_seq) {
           duplicate = true;
         }
-        recv_mark[peek_seq & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1)] =
+        recv_mark[peek_seq & g_pool_mask] =
             peek_seq;
       }
 
@@ -664,12 +752,8 @@ int main() {
       // Advance cumulative watermark
       if (peek_seq == g_ack_seq.load()) {
         uint32_t before = g_ack_seq.load();
-        while (recv_mark[g_ack_seq.load() & (DataBeam::SERVER_RECV_BUFFER_SIZE -
-                                             1)] == g_ack_seq.load()) {
-          // CRITICAL: Clear the mark so it doesn't interfere with the NEXT
-          // rotation
-          recv_mark[g_ack_seq.load() &
-                    (DataBeam::SERVER_RECV_BUFFER_SIZE - 1)] = 0;
+        while (recv_mark[g_ack_seq.load() & g_pool_mask] == g_ack_seq.load()) {
+          recv_mark[g_ack_seq.load() & g_pool_mask] = 0;
           g_ack_seq.fetch_add(1);
         }
         gap_filled = (g_ack_seq.load() > before + 1);
@@ -685,11 +769,12 @@ int main() {
         memset(&sack, 0, sizeof(sack));
         sack.type = 1;
         sack.ack_num = g_ack_seq.load();
+        sack.connection_id = g_connection_id; // Phase 6: CID
 
         // Build SACK bitmap: bit i = 1 if (ack_seq + i) already buffered
         for (int i = 0; i < DataBeam::SR_WINDOW_SIZE; i++) {
           uint32_t c = g_ack_seq.load() + (uint32_t)i;
-          if (recv_mark[c & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1)] == c) {
+          if (recv_mark[c & g_pool_mask] == c) {
             sack.bitmap[i >> 6] |= (1ULL << (i & 63));
           }
         }
@@ -746,8 +831,9 @@ int main() {
   net_recv_done.store(true, std::memory_order_release);
 
   // Wait for decompressors to drain the queue
-  for (int i = 0; i < DataBeam::SERVER_DECOMPRESSOR_THREADS; i++)
+  for (uint32_t i = 0; i < g_num_decompressors; i++)
     pthread_join(t_decompressors[i], nullptr);
+  delete[] t_decompressors;
 
   // Wait for writer to finish (it exits on EOF or termination check)
   // DO NOT set server_done before this — writer needs to finish processing
@@ -776,7 +862,7 @@ int main() {
     cout << "Network Recv:    " << avg_net << " us" << endl;
     cout << "Decrypt:         " << avg_decrypt << " us" << endl;
     cout << "Decompress:      " << avg_decomp << " us (across "
-         << DataBeam::SERVER_DECOMPRESSOR_THREADS << " threads)" << endl;
+         << g_num_decompressors << " threads)" << endl;
     cout << "Disk Write:      " << avg_disk
          << " us (If high, check SSD/HDD speed)" << endl;
     cout << "CRC Failures:    " << g_perf.crc_fails << endl;
@@ -785,6 +871,7 @@ int main() {
     cout << "-----------------------------------------------" << endl;
   }
 
+  delete[] recv_mark;
   delete[] g_pool;
   return 0;
 }

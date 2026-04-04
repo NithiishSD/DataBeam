@@ -54,6 +54,19 @@ constexpr uint32_t ADAPTIVE_MIN_RTO_MS = 50;
 constexpr uint32_t ADAPTIVE_MAX_RTO_MS = 2000;
 constexpr uint32_t CHECKPOINT_INTERVAL_PACKETS = 1000;
 
+// --- Network Probing ---
+constexpr uint32_t PROBE_PACKET_COUNT = 32;
+constexpr uint8_t PROBE_PACKET_TYPE = 5;
+constexpr uint8_t PROBE_RESULT_TYPE = 6;
+constexpr uint32_t PROBE_TIMEOUT_MS = 2000;
+
+// --- Vegas Congestion Control ---
+constexpr int32_t VEGAS_ALPHA_MS = 2;  // grow window if delay < alpha
+constexpr int32_t VEGAS_BETA_MS = 10;  // shrink window if delay > beta
+constexpr int32_t CWND_MIN = 64;       // minimum congestion window
+constexpr int32_t CWND_INCREMENT = 64; // additive increase per RTT cycle
+constexpr uint32_t VEGAS_ADJUST_INTERVAL = 100; // adjust every N ACKs
+
 // --- Security & Integrity ---
 constexpr uint32_t SHARED_SECRET_KEY_LEN = 16;
 constexpr uint8_t SHARED_SECRET_KEY[SHARED_SECRET_KEY_LEN] = {

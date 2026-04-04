@@ -8,7 +8,9 @@ using namespace std;
 
 // Constructor: Initialize SR ARQ state
 SelectiveRepeatARQ::SelectiveRepeatARQ()
-    : send_base(1), next_seq_num(1), rto_ms(DataBeam::SR_BASE_TIMEOUT_MS),
+    : send_base(1), next_seq_num(1),
+      effective_cwnd(DataBeam::SR_WINDOW_SIZE),
+      rto_ms(DataBeam::SR_BASE_TIMEOUT_MS),
       max_retransmits(DataBeam::SR_MAX_RETRANSMITS), in_flight_count(0) {
   pthread_mutex_init(&window_mutex, NULL);
   for (int i = 0; i < DataBeam::SR_WINDOW_SIZE; i++) {
@@ -28,7 +30,15 @@ bool SelectiveRepeatARQ::can_send_packet() const {
   // uint32 subtraction wraps correctly even across seq=0 boundary
   uint32_t in_use = next_seq_num - send_base;
   pthread_mutex_unlock(&window_mutex);
-  return in_use < (uint32_t)DataBeam::SR_WINDOW_SIZE;
+  // Phase 6: use effective_cwnd (dynamic) instead of compile-time SR_WINDOW_SIZE
+  return in_use < (uint32_t)effective_cwnd;
+}
+
+// Phase 6: Dynamic cwnd setter — called by receiver thread after Vegas adjust
+void SelectiveRepeatARQ::set_effective_cwnd(int32_t cwnd) {
+  // Clamp to [CWND_MIN, SR_WINDOW_SIZE] — array size is the hard ceiling
+  effective_cwnd = std::max((int32_t)DataBeam::CWND_MIN,
+                           std::min(cwnd, (int32_t)DataBeam::SR_WINDOW_SIZE));
 }
 
 // Get number of packets currently in flight
@@ -46,6 +56,7 @@ void SelectiveRepeatARQ::set_start_seq(uint32_t seq) {
   }
   in_flight_count.store(0, std::memory_order_relaxed);
   ack_bitmap.reset();
+  // effective_cwnd is NOT reset here — it's controlled by LiveState
   pthread_mutex_unlock(&window_mutex);
 }
 
@@ -105,13 +116,31 @@ void SelectiveRepeatARQ::handle_ack(uint32_t ack_num) {
 // freed. The ack_bitmap is reset because it is relative to send_base; the
 // caller re-populates it via mark_packet_acked() for any SACK bitmap-indicated
 // packets.
-void SelectiveRepeatARQ::handle_cumulative_ack(uint32_t cum_ack) {
+void SelectiveRepeatARQ::handle_cumulative_ack(uint32_t cum_ack,
+                                               int64_t *rtt_sample_us_out) {
   pthread_mutex_lock(&window_mutex);
 
   if (cum_ack <= send_base) {
     // Already past this point — duplicate/stale ACK, nothing to do
     pthread_mutex_unlock(&window_mutex);
+    if (rtt_sample_us_out) *rtt_sample_us_out = -1;
     return;
+  }
+
+  // Phase 6: Extract RTT sample from the packet at send_base before clearing
+  if (rtt_sample_us_out) {
+    uint32_t idx = send_base & (DataBeam::SR_WINDOW_SIZE - 1);
+    if (slot_occupied[idx] && window_buffer[idx].pkt.seq_num == send_base) {
+      timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      int64_t sent_us = (int64_t)window_buffer[idx].send_time.tv_sec * 1000000LL +
+                        (int64_t)window_buffer[idx].send_time.tv_nsec / 1000LL;
+      int64_t now_us = (int64_t)now.tv_sec * 1000000LL +
+                       (int64_t)now.tv_nsec / 1000LL;
+      *rtt_sample_us_out = now_us - sent_us;
+    } else {
+      *rtt_sample_us_out = -1;
+    }
   }
 
   // Mark slots covered by cumulative ACK as empty

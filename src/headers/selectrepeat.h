@@ -43,6 +43,11 @@ private:
   std::bitset<DataBeam::SR_WINDOW_SIZE>
       ack_bitmap; // ACK status: bit i = acked(base+i)?
 
+  // Phase 6: Effective congestion window (virtual limit within fixed array)
+  // Array size is always SR_WINDOW_SIZE (4096), but effective_cwnd limits
+  // how many packets can actually be in flight.
+  int32_t effective_cwnd;
+
   // Packet buffer: Pre-allocated circular array (O(1) access, zero heap churn)
   // Size is SR_WINDOW_SIZE (4096). Indexed by (seq_num & (SR_WINDOW_SIZE - 1)).
   WindowPacket window_buffer[DataBeam::SR_WINDOW_SIZE];
@@ -70,8 +75,12 @@ public:
   void set_start_seq(uint32_t seq);
   void increment_seq_num() { next_seq_num++; }
   int get_in_flight_count() const;
+  int32_t get_effective_cwnd() const { return effective_cwnd; }
 
-  // Dynamic tuning setters — called by timeout_thread via AdaptiveParams
+  // Phase 6: Dynamic cwnd — limits in-flight within the fixed 4096 array
+  void set_effective_cwnd(int32_t cwnd);
+
+  // Dynamic tuning setters — called by timeout_thread via LiveState
   void set_rto(int new_rto_ms) { rto_ms = (uint32_t)new_rto_ms; }
   void set_max_retransmits(int new_max) { max_retransmits = new_max; }
 
@@ -90,7 +99,9 @@ public:
   // Erases all buffered packets with seq < cum_ack, advances send_base,
   // and resets the ack_bitmap so the caller can re-populate it via
   // mark_packet_acked() for any bitmap-indicated out-of-order packets.
-  void handle_cumulative_ack(uint32_t cum_ack);
+  // Phase 6: rtt_sample_out receives RTT of the acked base packet (μs), or -1
+  void handle_cumulative_ack(uint32_t cum_ack,
+                             int64_t *rtt_sample_us_out = nullptr);
 
   // Mark packet as acknowledged
   void mark_packet_acked(uint32_t seq_num);

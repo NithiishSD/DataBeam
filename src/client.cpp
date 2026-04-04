@@ -6,9 +6,10 @@
 //   Stage 1 (dispatcher) — reads file chunks, assigns seq_nums
 //   Stage 2 (compressors) — N threads compress + encrypt + CRC in parallel
 //   Stage 3 (sender) — reorders, serializes, HMAC, WSASendTo, ARQ record
-
 #include "./headers/compress.h"
 #include "./headers/concurrentqueue.h"
+
+
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -30,9 +31,12 @@
 #include "./headers/constants.h"
 #include "./headers/crchw.h"
 #include "./headers/crypto.h"
+#include "./headers/livestate.h"
 #include "./headers/packet.h"
+#include "./headers/probe.h"
 #include "./headers/ringbuf.h"
 #include "./headers/selectrepeat.h"
+#include "./headers/sysprofile.h"
 
 // Tuning Constants (Now moved to constants.h)
 using namespace std;
@@ -139,47 +143,12 @@ int retransmissions = 0;
 volatile bool transfer_complete = false;
 bool disable_compression = false;
 
-// ----------------------------------------------------------------------------
-// AdaptiveParams — dynamic tuning based on observed loss and throughput
-//
-// RTO: starts at SR_PACKET_TIMEOUT_MS, doubles on each consecutive timeout
-//      (exponential backoff per RFC 6298), resets to base on successful ACK.
-// max_retransmits: scales with RTO so we don't abort too early under high loss.
-// ----------------------------------------------------------------------------
-struct AdaptiveParams {
-  // RTO state
-  std::atomic<int> rto_ms{DataBeam::SR_BASE_TIMEOUT_MS};
-  std::atomic<int> consecutive_timeouts{0};
-  static constexpr int MIN_RTO_MS = DataBeam::ADAPTIVE_MIN_RTO_MS; // floor
-  static constexpr int MAX_RTO_MS =
-      DataBeam::ADAPTIVE_MAX_RTO_MS; // ceiling (2s)
-
-  // Max retransmits: proportional to how long we're willing to wait
-  // Formula: at MIN_RTO each retry costs 50ms → 200*50ms=10s window
-  //          at MAX_RTO each retry costs 2000ms → 15 retries = 30s window
-  int get_max_retransmits() const {
-    // Allow up to 10 seconds of total retry time per packet
-    int budget_ms = 10 * DataBeam::MS_PER_SEC;
-    return std::max(10, budget_ms / rto_ms.load());
-  }
-
-  // Called when a packet times out — doubles RTO up to MAX
-  void on_timeout() {
-    int t = consecutive_timeouts.fetch_add(1) + 1;
-    int new_rto = DataBeam::SR_BASE_TIMEOUT_MS *
-                  (1 << std::min(t, 5)); // cap doubling at 32x
-    rto_ms.store(std::min(new_rto, MAX_RTO_MS));
-  }
-
-  // Called when an ACK arrives — resets backoff
-  void on_ack() {
-    if (consecutive_timeouts.load() > 0) {
-      consecutive_timeouts.store(0);
-      rto_ms.store(DataBeam::SR_BASE_TIMEOUT_MS);
-    }
-  }
-};
-AdaptiveParams g_adapt;
+// Phase 6: System profile and dynamic runtime state
+DataBeam::SystemProfile g_profile;
+DataBeam::LiveState g_live;
+uint64_t g_connection_id = 0;
+uint32_t g_num_compressors =
+    DataBeam::CLIENT_COMPRESSOR_THREADS; // set at startup
 
 // ----------------------------------------------------------------------------
 // Helper Functions
@@ -326,11 +295,13 @@ void *dispatcher_thread(void *arg) {
     // Back-pressure: total pipeline + in-flight must stay under window
     while (!transfer_complete) {
       int in_flight = arq.get_in_flight_count();
-      if (arq.can_send_packet() &&
+      uint32_t dispatched_in_flight = dispatch_seq.load() - arq.get_send_base();
+      
+      if (dispatched_in_flight < (uint32_t)g_live.cwnd.load() &&
           (int)(raw_queue.size_approx() + ready_queue.size_approx()) <
               (int)DataBeam::SR_WINDOW_SIZE / 4)
-        break;
-      SwitchToThread();
+             break;
+      Sleep(1);
     }
     if (transfer_complete)
       break;
@@ -440,6 +411,7 @@ void *compressor_thread(void *arg) {
     rp.pkt.chunk_offset = rc.offset;
     rp.pkt.data_len = (uint16_t)compressed_len;
     rp.pkt.flags = is_compressed ? 0x01 : 0x00;
+    rp.pkt.connection_id = g_connection_id; // Phase 6: CID
     memset(rp.pkt.hmac, 0, 16);
     memcpy(rp.pkt.data, encrypted_data, compressed_len);
 
@@ -491,37 +463,35 @@ void *sender_thread(void *arg) {
   while (!transfer_complete) {
     // ---- 1. Drain ready_queue into circular reorder buffer (O(1) each) --
     ReadyPacket rp;
-    while (ready_queue.try_dequeue(ctok, rp))
+    int drain_limit = 512;
+    while (drain_limit-- > 0 && ready_queue.try_dequeue(ctok, rp)) {
       pending->insert(rp.pkt.seq_num, rp);
+      if (pending->has(next_send_seq)) {
+        break; // Stop draining and go send it to update next_seq_num!
+      }
+    }
 
     // ---- 2. Send packets in strict seq_num order ----------------------
     while (pending->has(next_send_seq)) {
       // Window-space check: only lock when the window might be full
       int in_flight = arq.get_in_flight_count();
 
-      if (in_flight >= (int)DataBeam::SR_WINDOW_SIZE) {
+      if (in_flight >= g_live.cwnd.load()) {
         // Window full -- spin until an ACK slides it
         g_cperf.window_full_events.fetch_add(1, std::memory_order_relaxed);
         long long t_wait = g_cperf.now_us();
-        // static auto last_warn = chrono::steady_clock::now();
-        // auto now = chrono::steady_clock::now();
-        // if (chrono::duration_cast<chrono::milliseconds>(now -
-        // last_warn).count() > 1000)
-        // {
-        //   cout << "[SENDER] Window full: in_flight=" << in_flight
-        //        << " send_base=" << arq.get_send_base()
-        //        << " next_seq=" << arq.get_next_seq_num()
-        //        << " ready_q=" << ready_queue.size_approx() << endl;
-        //   last_warn = now;
-        // }
         while (!transfer_complete) {
           SwitchToThread();
           in_flight = arq.get_in_flight_count();
-          if (in_flight < (int)DataBeam::SR_WINDOW_SIZE)
+          if (in_flight < g_live.cwnd.load())
             break;
         }
         g_cperf.total_window_wait_us.fetch_add(g_cperf.now_us() - t_wait,
                                                std::memory_order_relaxed);
+      }
+      
+      if (in_flight > peak_inflight) {
+        peak_inflight = in_flight;
       }
       if (transfer_complete)
         return nullptr;
@@ -570,7 +540,7 @@ void *sender_thread(void *arg) {
 
     // ---- 3. Termination check ----------------------------------------
     if (compressors_done.load(std::memory_order_acquire) ==
-            DataBeam::CLIENT_COMPRESSOR_THREADS &&
+            (int)g_num_compressors &&
         ready_queue.size_approx() == 0 && pending->empty()) {
       int in_flight = arq.get_in_flight_count();
 
@@ -654,7 +624,9 @@ void *receiver_thread(void *arg) {
         pthread_mutex_lock(&arq_mutex);
         long long t_locked = ClientPerf::now_us();
         uint32_t cum = ack_pkt.ack_num;
-        arq.handle_cumulative_ack(cum);
+        // Phase 6: extract RTT sample for Jacobson's algorithm
+        int64_t rtt_sample_us = -1;
+        arq.handle_cumulative_ack(cum, &rtt_sample_us);
 
         // Heap-allocate to avoid stack overflow risk (BITMAP_ACK=512 * 4B = 2KB
         // on receiver stack)
@@ -688,14 +660,25 @@ void *receiver_thread(void *arg) {
         // backoff.
         static uint32_t last_cum_ack_seen = 0;
         if (cum > last_cum_ack_seen) {
-          g_adapt.on_ack();
+          g_live.on_ack();
+          // Phase 6: Feed RTT sample to Jacobson's algorithm
+          if (rtt_sample_us > 0) {
+            g_live.update_rtt(rtt_sample_us);
+            arq.set_rto(g_live.rto_ms.load());
+          }
           last_cum_ack_seen = cum;
         }
 
-        // Track actual peak in-flight count
-        int cur_inflight = arq.get_in_flight_count();
-        if (cur_inflight > peak_inflight)
-          peak_inflight = cur_inflight;
+        // Phase 6: Vegas congestion control (every N ACKs)
+        static uint32_t vegas_counter = 0;
+        vegas_counter++;
+        if (vegas_counter >= DataBeam::VEGAS_ADJUST_INTERVAL) {
+          int adj = g_live.vegas_adjust();
+          arq.set_effective_cwnd(g_live.cwnd.load());
+          vegas_counter = 0;
+        }
+
+        // Track actual peak in-flight count now correctly done in sender thread
 
         // 3. Find highest SACK bit across all 64 chunks
         int max_sack_idx = -1;
@@ -775,13 +758,14 @@ void *timeout_thread(void *arg) {
       int ready = 0;
 
       pthread_mutex_lock(&arq_mutex);
-      int dyn_max = g_adapt.get_max_retransmits();
+      int dyn_max = g_live.get_max_retransmits();
       arq.set_max_retransmits(dyn_max);
       ready = arq.prepare_retransmit(timed_out_seq, retransmit_pkt);
       if (ready == 1) {
         retransmissions++;
-        g_adapt.on_timeout(); // double the RTO
-        arq.set_rto(g_adapt.rto_ms.load());
+        g_live.on_timeout(); // Vegas: halve window + double RTO
+        arq.set_rto(g_live.rto_ms.load());
+        arq.set_effective_cwnd(g_live.cwnd.load());
       }
       pthread_mutex_unlock(&arq_mutex);
 
@@ -789,7 +773,8 @@ void *timeout_thread(void *arg) {
         // Only print when we actually retransmit — avoids spurious noise
         // when packet was already ACKed between check and prepare
         cout << "[TIMEOUT] Retransmitting seq=" << timed_out_seq
-             << " (rto=" << g_adapt.rto_ms.load() << "ms)" << endl;
+             << " (rto=" << g_live.rto_ms.load() << "ms"
+             << " cwnd=" << g_live.cwnd.load() << ")" << endl;
         SlimDataPacket pkt_send = retransmit_pkt;
         serialize_slim_packet(&pkt_send);
         sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
@@ -851,11 +836,24 @@ void handle_sigint(int sig) {
 int main(int argc, char *argv[]) {
 
   signal(SIGINT, handle_sigint);
-  cout << " LinkFlow Phase 5 Client Starting (3-Stage Pipeline + SR ARQ)..."
-       << endl;
+  cout << " DataBeam Phase 6 Client Starting (Autonomous Transport)..." << endl;
   cout << "CRC32 hardware acceleration: "
        << (has_hw_crc32() ? "ENABLED (SSE4.2)" : "fallback (slicing-by-8)")
        << endl;
+
+  // Phase 6: System Profiling
+  g_profile = DataBeam::SystemProfile::probe();
+  g_profile.print();
+  g_live.init_from_profile(g_profile);
+  g_num_compressors = g_live.compressor_threads;
+
+  // Generate Connection ID
+  generate_iv(&g_connection_id);
+  cout << " Connection ID: 0x" << hex << g_connection_id << dec << endl;
+
+  // Apply initial cwnd to ARQ
+  arq.set_effective_cwnd(g_live.cwnd.load());
+
   if (argc < 2) {
     cerr << "Usage: " << argv[0] << " <filename>" << endl;
     return 1;
@@ -932,9 +930,9 @@ int main(int argc, char *argv[]) {
   }
 
   cout << " SR Window=" << DataBeam::SR_WINDOW_SIZE
-       << ", RTO=" << DataBeam::SR_BASE_TIMEOUT_MS << "ms"
-       << ", Pipeline=" << DataBeam::CLIENT_COMPRESSOR_THREADS << " compressors"
-       << endl;
+       << ", cwnd=" << g_live.cwnd.load() << ", RTO=" << g_live.rto_ms.load()
+       << "ms"
+       << ", Pipeline=" << g_num_compressors << " compressors" << endl;
 
   // Check for resume checkpoint
   uint32_t starting_seq = 1;
@@ -993,6 +991,7 @@ int main(int argc, char *argv[]) {
   start_pkt.type = 2;
   start_pkt.file_size = file_size;
   start_pkt.total_chunks = total_chunks;
+  start_pkt.connection_id = g_connection_id; // Phase 6: CID
   strncpy(start_pkt.filename, filename.c_str(), DataBeam::MAX_FILENAME_LEN);
   serialize_start_packet(&start_pkt);
   sendto(sockfd, (const char *)&start_pkt, sizeof(start_pkt), 0,
@@ -1013,6 +1012,61 @@ int main(int argc, char *argv[]) {
 
       if (computed == received_crc && ack.ack_num == 0 && ack.type == 1) {
         cout << "[CLIENT] Handshake confirmed! Server ready." << endl;
+
+        // Phase 6: Measure handshake RTT
+        auto handshake_end = chrono::steady_clock::now();
+        int64_t handshake_rtt_us = chrono::duration_cast<chrono::microseconds>(
+                                       handshake_end - handshake_start)
+                                       .count();
+        cout << "[CLIENT] Handshake RTT: " << handshake_rtt_us << " us" << endl;
+
+        // Phase 6: Network Probing — send 32-packet train
+        cout << "[CLIENT] Starting network probe ("
+             << DataBeam::PROBE_PACKET_COUNT << " packets)..." << endl;
+        for (uint32_t i = 0; i < DataBeam::PROBE_PACKET_COUNT; i++) {
+          ProbePacket pp;
+          memset(&pp, 0, sizeof(pp));
+          pp.type = DataBeam::PROBE_PACKET_TYPE;
+          pp.probe_seq = (uint8_t)i;
+          pp.timestamp_ns =
+              (uint64_t)chrono::duration_cast<chrono::nanoseconds>(
+                  chrono::high_resolution_clock::now().time_since_epoch())
+                  .count();
+          pp.connection_id = g_connection_id;
+          serialize_probe_packet(&pp);
+          sendto(sockfd, (const char *)&pp, sizeof(pp), 0,
+                 (struct sockaddr *)&server_addr, addr_len);
+        }
+
+        // Wait for ProbeResult
+        auto probe_start = chrono::steady_clock::now();
+        bool probe_done = false;
+        while (!probe_done) {
+          char probe_buf[sizeof(ProbeResultPacket) + 64];
+          int pr = recvfrom(sockfd, probe_buf, sizeof(probe_buf), 0,
+                            (struct sockaddr *)&server_addr, &addr_len);
+          if (pr > 0 && (uint8_t)probe_buf[0] == DataBeam::PROBE_RESULT_TYPE) {
+            ProbeResultPacket result;
+            memcpy(&result, probe_buf, sizeof(result));
+            deserialize_probe_result(&result);
+
+            g_live.init_from_probe(result.bandwidth_bps, handshake_rtt_us);
+            arq.set_effective_cwnd(g_live.cwnd.load());
+
+            cout << "[PROBE] Bandwidth: " << result.bandwidth_bps / 1000000.0
+                 << " Mbps" << endl;
+            cout << "[PROBE] Initial cwnd: " << g_live.cwnd.load() << endl;
+            probe_done = true;
+          }
+          auto probe_elapsed = chrono::steady_clock::now() - probe_start;
+          if (chrono::duration_cast<chrono::milliseconds>(probe_elapsed)
+                  .count() > DataBeam::PROBE_TIMEOUT_MS) {
+            cout << "[PROBE] Timeout — using default cwnd="
+                 << g_live.cwnd.load() << endl;
+            probe_done = true;
+          }
+        }
+
         cout << "[CLIENT] Starting data transfer in 200ms..." << endl;
         Sleep(200); // brief pause — matches server's Sleep(200)
         handshake_done = true;
@@ -1029,6 +1083,7 @@ int main(int argc, char *argv[]) {
       start_pkt.type = 2;
       start_pkt.file_size = file_size;
       start_pkt.total_chunks = total_chunks;
+      start_pkt.connection_id = g_connection_id;
       strncpy(start_pkt.filename, filename.c_str(), DataBeam::MAX_FILENAME_LEN);
       serialize_start_packet(&start_pkt);
       sendto(sockfd, (const char *)&start_pkt, sizeof(start_pkt), 0,
@@ -1039,7 +1094,7 @@ int main(int argc, char *argv[]) {
 
   // ---- Launch 3-stage pipeline + receiver + timeout threads ----
   pthread_t t_dispatcher;
-  pthread_t t_compressors[DataBeam::CLIENT_COMPRESSOR_THREADS];
+  pthread_t *t_compressors = new pthread_t[g_num_compressors];
   pthread_t t_sender, t_timeout;
   pthread_t t_receiver;
   // pthread_t t_logger;
@@ -1047,18 +1102,19 @@ int main(int argc, char *argv[]) {
   pthread_create(&t_timeout, nullptr, timeout_thread, nullptr);
   pthread_create(&t_dispatcher, nullptr, dispatcher_thread, nullptr);
 
-  for (int i = 0; i < DataBeam::CLIENT_COMPRESSOR_THREADS; i++)
+  for (uint32_t i = 0; i < g_num_compressors; i++)
     pthread_create(&t_compressors[i], nullptr, compressor_thread, nullptr);
   pthread_create(&t_sender, nullptr, sender_thread, nullptr);
   // pthread_create(&t_logger, nullptr, logger_thread, nullptr);
 
   pthread_join(t_dispatcher, nullptr);
-  for (int i = 0; i < DataBeam::CLIENT_COMPRESSOR_THREADS; i++)
+  for (uint32_t i = 0; i < g_num_compressors; i++)
     pthread_join(t_compressors[i], nullptr);
   pthread_join(t_sender, nullptr);
   pthread_join(t_receiver, nullptr);
   pthread_join(t_timeout, nullptr);
   // pthread_join(t_logger, nullptr);
+  delete[] t_compressors;
 
   closesocket(sockfd); // [FIXED] close() → closesocket() on Windows/Winsock
   WSACleanup();

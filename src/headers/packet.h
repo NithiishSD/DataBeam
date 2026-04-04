@@ -35,27 +35,28 @@ struct ACKPacket {
                                                     // 64 bits = 4096 bits =
                                                     // SR_WINDOW_SIZE
   uint8_t type;                                     // Always set to 1 (ACK)
-  uint32_t crc32; // Integrity check for the ACK itself
+  uint64_t connection_id; // Phase 6: Connection Migration ID
+  uint32_t crc32; // Integrity check for the ACK itself (MUST be last field)
 };
 #pragma pack(pop)
 
 #pragma pack(push, 1)
 struct SlimDataPacket {
-  // --- 14 Bytes Core Header ---
+  // --- Core Header ---
   uint8_t type;
-  uint32_t seq_num;  // 4 bytes (Essential for files > 65MB)
-  uint32_t crc32;    // 4 bytes (Hardware-accelerated)
-  uint16_t data_len; // 2 bytes (Actual payload size)
+  uint32_t seq_num;      // 4 bytes (Essential for files > 65MB)
+  uint32_t crc32;        // 4 bytes (Hardware-accelerated)
+  uint16_t data_len;     // 2 bytes (Actual payload size)
 
-  uint8_t flags;         // 1 byte  (Bit 0: Encrypted, Bit 1-2: Stream ID)
-  uint16_t reserved;     // 2 bytes (Padding for 4-byte alignment)
-  uint32_t chunk_offset; // 4 bytes (Offset within the file)    max 4bg of dta
-                         // can be transmitted
-  // --- Phase 7 Security Hook (Reserved) ---
-  uint64_t packet_iv; // 8 bytes (Nonce for AES-GCM)
+  uint8_t flags;             // 1 byte  (Bit 0: Encrypted, Bit 1-2: Stream ID)
+  uint64_t connection_id;    // 8 bytes (Phase 6: Connection Migration ID)
+  uint32_t chunk_offset;     // 4 bytes (Offset within the file)
+
+  // --- Security ---
+  uint64_t packet_iv; // 8 bytes (Nonce for AES-CTR)
   uint8_t hmac[16];   // 16 bytes (Auth tag)
 
-  // --- 1440 Bytes Payload ---
+  // --- Payload ---
   char data[DataBeam::PACKET_DATA_SIZE + 1]; // The "Cargo"
 };
 #pragma pack(pop)
@@ -68,6 +69,7 @@ struct StartPacket {
   char filename[DataBeam::MAX_FILENAME_LEN]; // "stranger_things_s01e01.mkv"
   char username[DataBeam::MAX_USERNAME_LEN]; // "student_id_123"
   uint16_t window_size;                      // Initial negotiated window
+  uint64_t connection_id;                    // Phase 6: Connection Migration ID
 };
 #pragma pack(pop)
 // Serialize packet: convert host byte order to network byte order
@@ -82,6 +84,7 @@ inline void serialize_slim_packet(struct SlimDataPacket *pkt) {
   pkt->seq_num = htonl(pkt->seq_num);
   pkt->crc32 = htonl(pkt->crc32);
   pkt->data_len = htons(pkt->data_len);
+  pkt->connection_id = htonll(pkt->connection_id);
   pkt->chunk_offset = htonl(pkt->chunk_offset);
   pkt->packet_iv = htonll(pkt->packet_iv);
 }
@@ -90,6 +93,7 @@ inline void deserialize_slim_packet(struct SlimDataPacket *pkt) {
   pkt->seq_num = ntohl(pkt->seq_num);
   pkt->crc32 = ntohl(pkt->crc32);
   pkt->data_len = ntohs(pkt->data_len);
+  pkt->connection_id = ntohll(pkt->connection_id);
   pkt->chunk_offset = ntohl(pkt->chunk_offset);
   pkt->packet_iv = ntohll(pkt->packet_iv);
 }
@@ -98,12 +102,14 @@ inline void serialize_start_packet(struct StartPacket *pkt) {
   pkt->file_size = htonl(pkt->file_size);
   pkt->total_chunks = htonl(pkt->total_chunks);
   pkt->window_size = htons(pkt->window_size);
+  pkt->connection_id = htonll(pkt->connection_id);
 }
 
 inline void deserialize_start_packet(struct StartPacket *pkt) {
   pkt->file_size = ntohl(pkt->file_size);
   pkt->total_chunks = ntohl(pkt->total_chunks);
   pkt->window_size = ntohs(pkt->window_size);
+  pkt->connection_id = ntohll(pkt->connection_id);
 }
 
 inline void serialize_ack_packet(struct ACKPacket *pkt) {
@@ -111,6 +117,7 @@ inline void serialize_ack_packet(struct ACKPacket *pkt) {
   for (int i = 0; i < DataBeam::SR_SACK_BITMAP_CHUNKS; i++) {
     pkt->bitmap[i] = htonll(pkt->bitmap[i]);
   }
+  pkt->connection_id = htonll(pkt->connection_id);
   pkt->crc32 = htonl(pkt->crc32);
 }
 
@@ -119,6 +126,7 @@ inline void deserialize_ack_packet(struct ACKPacket *pkt) {
   for (int i = 0; i < DataBeam::SR_SACK_BITMAP_CHUNKS; i++) {
     pkt->bitmap[i] = ntohll(pkt->bitmap[i]);
   }
+  pkt->connection_id = ntohll(pkt->connection_id);
   pkt->crc32 = ntohl(pkt->crc32);
 }
 #endif
